@@ -1,0 +1,11 @@
+venv/
+loot/
+__pycache__/
+*.log
+*.db
+deepseek_copy/
+build/
+dist/
+*.pyc
+.idea/
+.vscode/
